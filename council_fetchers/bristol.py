@@ -1,6 +1,6 @@
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+import BeautifulSoup
 from io import BytesIO
 
 council_name = "Bristol"
