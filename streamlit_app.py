@@ -1,152 +1,265 @@
-import streamlit as st
+import os
+import glob
+import importlib.util
 import sqlite3
+from datetime import date
+from typing import List, Tuple
+
 import pandas as pd
-import altair as alt
-from db_schema import DB_NAME
+import plotly.express as px
+import streamlit as st
+
+from db_schema import create_tables, DB_NAME
+from fetch_and_ingest import insert_records
+from council_auto_discovery import discover_new_councils, fetch_new_council_csv
 
 st.set_page_config(page_title="UK Public Spending Tracker", layout="wide")
-
-# --------------------------
-# Database helpers
-# --------------------------
-
-def _connect():
-    """Return a new SQLite connection (lightweight, safe per-query)."""
-    return sqlite3.connect(DB_NAME, check_same_thread=False)
-
-@st.cache_data(show_spinner=False)
-def _query_df(sql: str, params: tuple = ()):
-    """Run a query and return a DataFrame, cached by Streamlit."""
-    with _connect() as conn:
-        return pd.read_sql_query(sql, conn, params=params)
-
-# --------------------------
-# UI
-# --------------------------
-
 st.title("UK Public Spending Tracker")
 
-# Fetch councils
-councils_df = _query_df("SELECT DISTINCT council FROM payments ORDER BY council")
-councils = councils_df["council"].tolist()
+@st.cache_data(show_spinner=False)
+def _connect():
+    return sqlite3.connect(DB_NAME)
 
-selected_council = st.sidebar.selectbox("Select Council", councils)
+def _query_df(sql: str, params: tuple = ()):
+    conn = _connect()
+    return pd.read_sql_query(sql, conn, params=params)
 
-# Fetch data for selected council
-df = _query_df(
-    "SELECT * FROM payments WHERE council = ? ORDER BY payment_date DESC",
-    params=(selected_council,)
-)
+def _get_councils() -> List[str]:
+    df = _query_df("SELECT DISTINCT council FROM payments ORDER BY council;")
+    return df["council"].tolist()
 
-if df.empty:
-    st.warning(f"No payments found for {selected_council}.")
+def _load_predefined_councils() -> List[Tuple[str, str, callable]]:
+    """Return list of (name, csv_url, fetch_fn|None)."""
+    fetcher_dir = "council_fetchers"
+    files = sorted([f for f in glob.glob(os.path.join(fetcher_dir, "*.py")) if not f.endswith("__init__.py")])
+    items = []
+    for path in files:
+        spec = importlib.util.spec_from_file_location("cmod", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore
+        name = getattr(mod, "council_name", os.path.basename(path).replace(".py", "").title())
+        csv_url = getattr(mod, "csv_url", None)
+        fetch_fn = getattr(mod, "fetch_payments", None)
+        items.append((name, csv_url, fetch_fn))
+    return items
+
+with st.spinner("Setting up database…"):
+    create_tables()
+
+st.sidebar.header("Data controls")
+refresh = st.sidebar.button("Refresh all data (free sources)", type="primary")
+geocode_toggle = st.sidebar.checkbox("Geocode suppliers on import (slow; free Nominatim)", value=False)
+
+if refresh:
+    progress = st.sidebar.progress(0, text="Refreshing data…")
+    inserted_total = skipped_total = 0
+
+    # 1) Predefined councils (custom fetchers)
+    items = _load_predefined_councils()
+    for i, (name, csv_url, fetch_fn) in enumerate(items, start=1):
+        progress.progress(int(10 + (i / max(1, len(items))) * 40), text=f"Fetching: {name}")
+        try:
+            if callable(fetch_fn):
+                records = fetch_fn()
+            elif csv_url:
+                records = fetch_new_council_csv(csv_url, name)
+            else:
+                records = []
+            ins, skip = insert_records(records, do_geocode=geocode_toggle)
+            inserted_total += ins
+            skipped_total += skip
+        except Exception as e:
+            st.warning(f"Failed to import {name}: {e}")
+
+    # 2) Discover more councils via data.gov.uk
+    try:
+        discovered = discover_new_councils()
+    except Exception as e:
+        discovered = []
+        st.info(f"Discovery skipped: {e}")
+
+    for j, (name, url) in enumerate(discovered, start=1):
+        progress.progress(int(55 + (j / max(1, len(discovered))) * 35), text=f"Importing discovered: {name}")
+        try:
+            records = fetch_new_council_csv(url, name)
+            # Keep discovery fast; geocoding can be re-run later
+            ins, skip = insert_records(records, do_geocode=False)
+            inserted_total += ins
+            skipped_total += skip
+        except Exception:
+            continue
+
+    progress.progress(96, text="Finalizing…")
+    st.success(f"Refresh complete. Inserted {inserted_total:,} new rows; skipped {skipped_total:,} (dupes/unparseable).")
+
+# Filters
+st.sidebar.subheader("Filters")
+councils = _get_councils()
+if not councils:
+    st.info("No data yet. Click **Refresh all data** to import from free council CSVs.")
     st.stop()
 
-# Convert date column
-df["payment_date"] = pd.to_datetime(df["payment_date"], errors="coerce")
+sel_council = st.sidebar.selectbox("Council", councils, index=0)
+start_date = st.sidebar.date_input("Start date", value=date(2023, 1, 1))
+end_date = st.sidebar.date_input("End date", value=date.today())
+supplier_query = st.sidebar.text_input("Supplier contains", "")
 
-# Sidebar filters
-with st.sidebar:
-    st.subheader("Filters")
+params = [sel_council, start_date.isoformat(), end_date.isoformat()]
+sql = """
+SELECT * FROM payments
+WHERE council = ?
+  AND payment_date BETWEEN ? AND ?
+"""
+if supplier_query.strip():
+    sql += " AND lower(supplier) LIKE ?"
+    params.append(f"%{supplier_query.lower()}%")
 
-    min_date, max_date = df["payment_date"].min(), df["payment_date"].max()
-    date_range = st.date_input("Date range", [min_date, max_date])
+df = _query_df(sql, tuple(params))
 
-    suppliers = ["All"] + sorted(df["supplier"].dropna().unique().tolist())
-    supplier_filter = st.selectbox("Supplier", suppliers)
+# KPIs
+cols = st.columns(3)
+with cols[0]:
+    st.metric("Total paid", f"£{df['amount_gbp'].sum():,.2f}")
+with cols[1]:
+    st.metric("Transactions", f"{len(df):,}")
+with cols[2]:
+    ts = pd.to_datetime(df["payment_date"], errors="coerce")
+    if not ts.empty and ts.notna().any():
+        st.metric("Date range", f"{ts.min().date()} → {ts.max().date()}")
+    else:
+        st.metric("Date range", "—")
 
-    categories = ["All"] + sorted(df["category"].dropna().unique().tolist())
-    category_filter = st.selectbox("Category", categories)
-
-# Apply filters
-mask = (df["payment_date"].between(pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])))
-if supplier_filter != "All":
-    mask &= df["supplier"] == supplier_filter
-if category_filter != "All":
-    mask &= df["category"] == category_filter
-
-filtered = df[mask]
-
-# --------------------------
-# Metrics
-# --------------------------
-
-total_spend = filtered["amount_gbp"].sum()
-num_payments = len(filtered)
-avg_payment = filtered["amount_gbp"].mean() if num_payments else 0
-
-c1, c2, c3 = st.columns(3)
-c1.metric("Total Spend (£)", f"{total_spend:,.2f}")
-c2.metric("Number of Payments", f"{num_payments:,}")
-c3.metric("Average Payment (£)", f"{avg_payment:,.2f}")
-
-# --------------------------
 # Charts
-# --------------------------
-
-st.subheader("Spending Over Time")
-spend_over_time = (
-    filtered.groupby("payment_date")["amount_gbp"]
-    .sum()
-    .reset_index()
-)
-
-if not spend_over_time.empty:
-    chart = (
-        alt.Chart(spend_over_time)
-        .mark_line(point=True)
-        .encode(
-            x="payment_date:T",
-            y="amount_gbp:Q",
-            tooltip=["payment_date:T", "amount_gbp:Q"]
-        )
-        .interactive()
-    )
-    st.altair_chart(chart, use_container_width=True)
+if df.empty:
+    st.warning("No rows match your filters.")
 else:
-    st.info("No spending data available for this date range.")
-
-st.subheader("Top Suppliers")
-top_suppliers = (
-    filtered.groupby("supplier")["amount_gbp"]
-    .sum()
-    .nlargest(10)
-    .reset_index()
-)
-
-if not top_suppliers.empty:
-    bar_chart = (
-        alt.Chart(top_suppliers)
-        .mark_bar()
-        .encode(
-            x=alt.X("amount_gbp:Q", title="Spend (£)"),
-            y=alt.Y("supplier:N", sort="-x"),
-            tooltip=["supplier:N", "amount_gbp:Q"]
+    left, right = st.columns(2)
+    with left:
+        sup = (
+            df.groupby("supplier", dropna=False, as_index=False)["amount_gbp"]
+            .sum()
+            .sort_values("amount_gbp", ascending=False)
+            .head(10)
         )
+        st.plotly_chart(px.bar(sup, x="supplier", y="amount_gbp", title="Top suppliers (by £)"), use_container_width=True)
+
+    with right:
+        dt = pd.to_datetime(df["payment_date"], errors="coerce")
+        df_time = (
+            df.assign(payment_month=dt.dt.to_period("M").dt.to_timestamp())
+            .groupby("payment_month", as_index=False)["amount_gbp"]
+            .sum()
+        )
+        st.plotly_chart(px.line(df_time, x="payment_month", y="amount_gbp", title="Payments over time"), use_container_width=True)
+
+    # Map if lat/lon available
+    if {"lat", "lon"}.issubset(df.columns) and df[["lat", "lon"]].notna().any().any():
+        figm = px.scatter_mapbox(
+            df.dropna(subset=["lat", "lon"]),
+            lat="lat",
+            lon="lon",
+            hover_name="supplier",
+            hover_data={"amount_gbp": ":.2f", "description": True, "lat": False, "lon": False},
+            size="amount_gbp",
+            zoom=5,
+            height=450,
+        )
+        figm.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=40, b=0), title="Geocoded payments")
+        st.plotly_chart(figm, use_container_width=True)
+
+# Anomalies / Alerts
+with st.expander("Anomalies / Alerts", expanded=False):
+    a1 = _query_df("""
+        SELECT id, council, supplier, amount_gbp, payment_date
+        FROM payments
+        WHERE council = ? AND amount_gbp > 100000
+        ORDER BY amount_gbp DESC
+    """, (sel_council,))
+    st.subheader("Large payments (> £100k)")
+    st.dataframe(a1, use_container_width=True)
+
+    a2 = _query_df("""
+        SELECT council, supplier, strftime('%Y-%m', payment_date) AS ym, COUNT(*) AS cnt, SUM(amount_gbp) AS total
+        FROM payments
+        WHERE council = ?
+        GROUP BY council, supplier, ym
+        HAVING cnt > 5
+        ORDER BY cnt DESC
+    """, (sel_council,))
+    st.subheader("Frequent monthly payments (>5)")
+    st.dataframe(a2, use_container_width=True)
+
+    a3 = _query_df("""
+        SELECT invoice_ref, COUNT(*) AS cnt, SUM(amount_gbp) AS total
+        FROM payments
+        WHERE council = ? AND invoice_ref IS NOT NULL AND TRIM(invoice_ref) <> ''
+        GROUP BY invoice_ref
+        HAVING cnt > 1
+        ORDER BY cnt DESC
+    """, (sel_council,))
+    st.subheader("Duplicate invoice references")
+    st.dataframe(a3, use_container_width=True)
+
+    a4 = _query_df("""
+        SELECT id, supplier, amount_gbp, payment_date, description
+        FROM payments
+        WHERE council = ? AND (invoice_ref IS NULL OR TRIM(invoice_ref) = '')
+        ORDER BY payment_date DESC
+    """, (sel_council,))
+    st.subheader("Payments without invoice reference")
+    st.dataframe(a4, use_container_width=True)
+
+    dom = _query_df("""
+        WITH sums AS (
+            SELECT supplier, SUM(amount_gbp) AS total
+            FROM payments
+            WHERE council = ?
+            GROUP BY supplier
+        ), grand AS (
+            SELECT SUM(amount_gbp) AS gt FROM payments WHERE council = ?
+        )
+        SELECT s.supplier, s.total, g.gt, 100.0 * s.total / g.gt AS pct
+        FROM sums s, grand g
+        ORDER BY s.total DESC
+        LIMIT 1
+    """, (sel_council, sel_council))
+    if not dom.empty and float(dom["pct"].iloc[0]) > 50.0:
+        st.error(f"Supplier dominance: {dom['supplier'].iloc[0]} accounts for {dom['pct'].iloc[0]:.1f}% of spend (£{dom['total'].iloc[0]:,.0f}).")
+
+# Feedback form
+st.header("Citizen feedback")
+with st.form("feedback"):
+    pid = st.number_input("Payment ID", min_value=1, step=1)
+    uname = st.text_input("Your name (optional)")
+    comment = st.text_area("Comment")
+    rating = st.slider("Rating", 1, 5, 3)
+    submitted = st.form_submit_button("Submit feedback")
+    if submitted:
+        conn = _connect()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO feedback (payment_id, user_name, comment, rating) VALUES (?,?,?,?)",
+            (int(pid), uname.strip(), comment.strip(), int(rating)),
+        )
+        conn.commit()
+        st.success("Thanks! Your feedback has been recorded.")
+
+fb = _query_df("""
+    SELECT f.created_at, f.payment_id, f.user_name, f.comment, f.rating
+    FROM feedback f
+    WHERE f.payment_id IN (SELECT id FROM payments WHERE council = ?)
+    ORDER BY f.created_at DESC
+    LIMIT 200
+""", (sel_council,))
+if not fb.empty:
+    st.subheader("Recent feedback")
+    st.dataframe(fb, use_container_width=True)
+
+# CSV export
+if not df.empty:
+    st.download_button(
+        "Download filtered CSV",
+        df.to_csv(index=False).encode("utf-8"),
+        file_name=f"{sel_council}_payments.csv",
+        mime="text/csv",
     )
-    st.altair_chart(bar_chart, use_container_width=True)
-else:
-    st.info("No supplier data available for this selection.")
-
-# --------------------------
-# Data Table
-# --------------------------
-
-st.subheader("Payments Data")
-st.dataframe(
-    filtered[["payment_date", "supplier", "description", "category", "amount_gbp", "invoice_ref"]],
-    use_container_width=True
-)
-
-# Option to download data
-@st.cache_data(show_spinner=False)
-def convert_df(df: pd.DataFrame):
-    return df.to_csv(index=False).encode("utf-8")
-
-st.download_button(
-    "Download data as CSV",
-    convert_df(filtered),
-    f"{selected_council}_payments.csv",
-    "text/csv",
-    key="download-csv"
-)
