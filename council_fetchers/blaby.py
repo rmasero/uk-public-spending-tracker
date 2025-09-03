@@ -1,50 +1,81 @@
 import pandas as pd
 import requests
+from io import BytesIO, StringIO
 from bs4 import BeautifulSoup
-from io import BytesIO
+import os
 
 council_name = "Blaby"
-csv_url = "https://www.blaby.gov.uk/open-data/payments.csv"  # Fallback/legacy
+csv_url = "https://www.blaby.gov.uk/open-data/payments.csv"
+payments_page = "https://www.blaby.gov.uk/your-council/performance-and-budgets/payments-to-suppliers/"
+
+def _update_this_file(new_url):
+    """Update this Python file with the discovered csv_url."""
+    path = os.path.abspath(__file__)
+    with open(path, "r") as f:
+        lines = f.readlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith("csv_url ="):
+            lines[i] = f'csv_url = "{new_url}"\n'
+    with open(path, "w") as f:
+        f.writelines(lines)
+
+def _scrape_and_combine_csvs():
+    r = requests.get(payments_page)
+    soup = BeautifulSoup(r.content, "html.parser")
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if ".csv" in href.lower():
+            if not href.startswith("http"):
+                href = "https://www.blaby.gov.uk" + href
+            links.append(href)
+    dfs = []
+    for url in links:
+        try:
+            df = pd.read_csv(url)
+            dfs.append(df)
+        except Exception:
+            continue
+    if dfs:
+        return pd.concat(dfs, ignore_index=True)
+    return pd.DataFrame()
 
 def fetch_payments():
-    # Try static CSV first
+    # Try direct CSV
     try:
         r = requests.get(csv_url, timeout=10)
-        if r.ok and r.headers.get("content-type", "").startswith("text/csv"):
-            df = pd.read_csv(BytesIO(r.content))
-            if not df.empty:
-                return _format_blaby(df)
+        df = pd.read_csv(BytesIO(r.content))
+        if not df.empty:
+            return [
+                {
+                    "council": council_name,
+                    "payment_date": row.get("Date"),
+                    "supplier": row.get("Supplier"),
+                    "description": row.get("Purpose"),
+                    "category": row.get("Department", ""),
+                    "amount_gbp": row.get("Amount"),
+                    "invoice_ref": row.get("InvoiceRef", "")
+                }
+                for _, row in df.iterrows()
+            ]
     except Exception:
         pass
 
-    # Scrape monthly CSVs
-    page_url = "https://www.blaby.gov.uk/your-council/performance-and-budgets/payments-to-suppliers/"
-    r = requests.get(page_url)
-    soup = BeautifulSoup(r.text, "html.parser")
-    links = [a["href"] for a in soup.select('a[href$=".csv"]')]
-    all_payments = []
-    for link in links:
-        if not link.startswith("http"):
-            link = "https://www.blaby.gov.uk" + link
-        try:
-            df = pd.read_csv(link)
-            if not df.empty:
-                all_payments.extend(_format_blaby(df))
-        except Exception:
-            continue
-    return all_payments
-
-def _format_blaby(df):
-    # Column names may vary per file; best effort normalization
-    return [
-        {
-            "council": council_name,
-            "payment_date": row.get("Date") or row.get("Payment Date"),
-            "supplier": row.get("Supplier"),
-            "description": row.get("Purpose") or row.get("Description"),
-            "category": row.get("Department", ""),
-            "amount_gbp": row.get("Amount") or row.get("Amount (£)"),
-            "invoice_ref": row.get("InvoiceRef", "") or row.get("Invoice Ref", "")
-        }
-        for _, row in df.iterrows()
-    ]
+    # Scrape for monthly CSVs
+    df = _scrape_and_combine_csvs()
+    if not df.empty:
+        # Update this file to use the first monthly CSV as csv_url for next time
+        _update_this_file(df.attrs.get('csv_url', csv_url))
+        return [
+            {
+                "council": council_name,
+                "payment_date": row.get("Date"),
+                "supplier": row.get("Supplier"),
+                "description": row.get("Purpose"),
+                "category": row.get("Department", ""),
+                "amount_gbp": row.get("Amount"),
+                "invoice_ref": row.get("InvoiceRef", "")
+            }
+            for _, row in df.iterrows()
+        ]
+    return []
