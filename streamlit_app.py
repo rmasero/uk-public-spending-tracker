@@ -8,56 +8,13 @@ from pattern_detection import detect_anomalies
 from council_auto_discovery import discover_new_councils, fetch_new_council_csv
 from geocode import geocode_address
 import plotly.express as px
-import time
-import os
+import glob
 import importlib.util
-import socket
+import os
+import time
+import requests
 
 DB_NAME = "spend.db"
-COUNCIL_FETCHERS_DIR = "council_fetchers"
-COUNCIL_FETCH_TIMEOUT = 10  # seconds
-
-def fetch_with_timeout(fetch_fn, *args, **kwargs):
-    # Run fetch_fn with timeout using a separate thread, fallback if times out
-    import threading
-
-    result = {}
-    exception = {}
-
-    def target():
-        try:
-            result['value'] = fetch_fn(*args, **kwargs)
-        except Exception as e:
-            exception['error'] = e
-
-    thread = threading.Thread(target=target)
-    thread.daemon = True
-    thread.start()
-    thread.join(COUNCIL_FETCH_TIMEOUT)
-    if thread.is_alive():
-        return None, "timeout"
-    if 'error' in exception:
-        return None, exception['error']
-    return result.get('value', None), None
-
-def load_predefined_councils():
-    """Dynamically import council fetchers and yield (council_name, csv_url)."""
-    council_fetchers = []
-    # List .py files in council_fetchers dir except __init__.py
-    for fname in os.listdir(COUNCIL_FETCHERS_DIR):
-        if fname.endswith(".py") and fname != "__init__.py":
-            module_name = fname[:-3]
-            module_path = os.path.join(COUNCIL_FETCHERS_DIR, fname)
-            spec = importlib.util.spec_from_file_location(module_name, module_path)
-            mod = importlib.util.module_from_spec(spec)
-            try:
-                spec.loader.exec_module(mod)
-                if hasattr(mod, "get_council_csv_url"):
-                    council_name, csv_url = mod.get_council_csv_url()
-                    council_fetchers.append((council_name, csv_url))
-            except Exception as e:
-                st.sidebar.warning(f"Failed to load {fname}: {e}")
-    return council_fetchers
 
 # --------------------------
 # Initialize database
@@ -77,73 +34,106 @@ progress_text = "Starting up, please wait..."
 progress_bar = st.sidebar.progress(0, text=progress_text)
 
 # --------------------------
-# 1. Load predefined council fetchers first
+# Helper: Load council fetchers
 # --------------------------
-progress_bar.progress(5, text="Loading predefined councils...")
-predefined_councils = load_predefined_councils()
-
-skipped_predefined = []  # For retry
-for i, (council_name, csv_url) in enumerate(predefined_councils, 1):
-    progress = 5 + int(i * (15/ max(len(predefined_councils), 1)))
-    progress_bar.progress(progress, text=f"Ingesting data for: {council_name} (predefined)")
-    try:
-        # Use timeout handling for fetch_new_council_csv
-        records, err = fetch_with_timeout(fetch_new_council_csv, csv_url, council_name)
-        if err is not None or records is None:
-            skipped_predefined.append((council_name, csv_url))
+def load_predefined_councils():
+    fetcher_files = glob.glob("council_fetchers/*.py")
+    councils_loaded = []
+    errors = []
+    for i, file in enumerate(fetcher_files, 1):
+        module_name = os.path.splitext(os.path.basename(file))[0]
+        spec = importlib.util.spec_from_file_location(module_name, file)
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+            if hasattr(module, "COUNCIL_NAME") and hasattr(module, "CSV_URL"):
+                council_name = module.COUNCIL_NAME
+                csv_url = module.CSV_URL
+                try:
+                    progress_bar.progress(min(5 + int(i * (15/len(fetcher_files))), 20), text=f"Loading predefined: {council_name}")
+                    records = fetch_new_council_csv(csv_url, council_name)
+                    insert_records(records)
+                    councils_loaded.append(council_name)
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                    errors.append((council_name, csv_url))
+                    continue  # skip this, will retry later
+        except Exception:
             continue
-        insert_records(records)
-    except Exception as e:
-        skipped_predefined.append((council_name, csv_url))
+    return councils_loaded, errors
 
-progress_bar.progress(21, text="Predefined councils loaded, retrying any skipped ones...")
-# Retry skipped predefined councils
-for council_name, csv_url in skipped_predefined:
-    try:
-        records, err = fetch_with_timeout(fetch_new_council_csv, csv_url, council_name)
-        if err is not None or records is None:
-            st.sidebar.warning(f"Could not load predefined council: {council_name} (skipped due to: {err or 'unknown error'})")
-            continue
-        insert_records(records)
-    except Exception as e:
-        st.sidebar.warning(f"Could not load predefined council: {council_name} (skipped due to: {e})")
+def try_failed_predefined(failed):
+    retried = []
+    for i, (council_name, csv_url) in enumerate(failed, 1):
+        try:
+            progress_bar.progress(min(20 + int(i * (10/max(1, len(failed)))), 30), text=f"Retrying: {council_name}")
+            records = fetch_new_council_csv(csv_url, council_name)
+            insert_records(records)
+            retried.append((council_name, csv_url))
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            continue  # skip again silently
+    return retried
 
-# --------------------------
-# 2. Discover and ingest new councils automatically, skipping timeouts and retrying after all
-# --------------------------
-progress_bar.progress(25, text="Discovering new councils...")
+def try_failed_new_councils(failed):
+    retried = []
+    for i, (council_name, csv_url) in enumerate(failed, 1):
+        try:
+            progress_bar.progress(min(45 + int(i * (5/max(1, len(failed)))), 50), text=f"Retrying new: {council_name}")
+            records = fetch_new_council_csv(csv_url, council_name)
+            insert_records(records)
+            retried.append((council_name, csv_url))
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            continue  # skip again silently
+    return retried
+
+# 1. Load predefined councils from council_fetchers folder
+progress_bar.progress(3, text="Loading predefined councils...")
+predefined_loaded, predefined_failed = load_predefined_councils()
+progress_bar.progress(22, text="Predefined councils loaded.")
+
+# 2. Try failed predefined councils again (retry after all others)
+progress_bar.progress(25, text="Retrying failed predefined councils...")
+retried_predefined = try_failed_predefined(predefined_failed)
+progress_bar.progress(30, text="Predefined retry done.")
+
+# 3. Discover and ingest new councils automatically (after predefined)
+progress_bar.progress(32, text="Discovering new councils...")
 new_councils = discover_new_councils()
-skipped_new = []
+new_failed = []
 if new_councils:
     for i, (council_name, csv_url) in enumerate(new_councils, 1):
-        progress = 25 + int(i * (15/ max(len(new_councils), 1)))
-        progress_bar.progress(progress, text=f"Ingesting data for: {council_name} (new discovery)")
         try:
-            records, err = fetch_with_timeout(fetch_new_council_csv, csv_url, council_name)
-            if err is not None or records is None:
-                skipped_new.append((council_name, csv_url))
-                continue
+            progress_bar.progress(33 + int(i * (12/len(new_councils))), text=f"Ingesting new: {council_name}")
+            records = fetch_new_council_csv(csv_url, council_name)
             insert_records(records)
-        except Exception as e:
-            skipped_new.append((council_name, csv_url))
-else:
-    progress_bar.progress(40, text="No new councils discovered.")
-
-progress_bar.progress(41, text="Retrying skipped new council fetchers...")
-for council_name, csv_url in skipped_new:
-    try:
-        records, err = fetch_with_timeout(fetch_new_council_csv, csv_url, council_name)
-        if err is not None or records is None:
-            st.sidebar.warning(f"Could not load new council: {council_name} (skipped due to: {err or 'unknown error'})")
+            time.sleep(0.05)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            new_failed.append((council_name, csv_url))
             continue
-        insert_records(records)
-    except Exception as e:
-        st.sidebar.warning(f"Could not load new council: {council_name} (skipped due to: {e})")
+else:
+    progress_bar.progress(45, text="No new councils discovered.")
 
-# --------------------------
-# 3. Fetch list of councils from DB
-# --------------------------
-progress_bar.progress(45, text="Fetching list of councils...")
+# 4. Try failed new councils again after all others
+progress_bar.progress(48, text="Retrying failed new councils...")
+retried_new = try_failed_new_councils(new_failed)
+progress_bar.progress(52, text="All councils loaded.")
+
+# 5. Automatically look for more councils after all others
+progress_bar.progress(55, text="Scanning for more councils...")
+more_new_councils = discover_new_councils()
+if more_new_councils:
+    for i, (council_name, csv_url) in enumerate(more_new_councils, 1):
+        try:
+            progress_bar.progress(56 + int(i * (4/len(more_new_councils))), text=f"Loading more: {council_name}")
+            records = fetch_new_council_csv(csv_url, council_name)
+            insert_records(records)
+            time.sleep(0.05)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            continue  # skip silently
+
+progress_bar.progress(60, text="Council loading complete.")
+
+# 6. Fetch list of councils from DB
+progress_bar.progress(65, text="Fetching list of councils...")
 conn = sqlite3.connect(DB_NAME)
 c = conn.cursor()
 c.execute("SELECT DISTINCT council FROM payments")
@@ -156,19 +146,15 @@ if not councils:
 
 selected_council = st.sidebar.selectbox("Select council", sorted(councils))
 
-# --------------------------
-# 4. Filters
-# --------------------------
-progress_bar.progress(50, text="Loading filters...")
+# 7. Filters
+progress_bar.progress(70, text="Loading filters...")
 st.sidebar.subheader("Filters")
 start_date = st.sidebar.date_input("Start date", datetime(2023,1,1))
 end_date = st.sidebar.date_input("End date", datetime.today())
 supplier_search = st.sidebar.text_input("Supplier search")
 
-# --------------------------
-# 5. Fetch filtered data
-# --------------------------
-progress_bar.progress(60, text="Fetching payments data...")
+# 8. Fetch filtered data
+progress_bar.progress(75, text="Fetching payments data...")
 conn = sqlite3.connect(DB_NAME)
 query = "SELECT * FROM payments WHERE council = ? AND payment_date BETWEEN ? AND ?"
 params = [selected_council, start_date.isoformat(), end_date.isoformat()]
@@ -178,39 +164,30 @@ if supplier_search:
 
 df = pd.read_sql_query(query, conn, params=params)
 conn.close()
-progress_bar.progress(68, text="Payments data loaded.")
+progress_bar.progress(80, text="Payments data loaded.")
 
-# --------------------------
-# 6. Display summary stats
-# --------------------------
-progress_bar.progress(70, text="Calculating summary statistics...")
+# 9. Display summary stats
 st.title(f"{selected_council} Public Spending")
 st.markdown(f"Showing payments from {start_date} to {end_date}")
 st.write(f"**Total payments:** £{df['amount_gbp'].sum():,.2f}")
 st.write(f"**Number of transactions:** {len(df)}")
 
-# --------------------------
-# 7. Top suppliers
-# --------------------------
-progress_bar.progress(75, text="Calculating top suppliers...")
+# 10. Top suppliers
+progress_bar.progress(83, text="Calculating top suppliers...")
 top_suppliers = df.groupby("supplier")['amount_gbp'].sum().sort_values(ascending=False).head(10).reset_index()
 fig1 = px.bar(top_suppliers, x="supplier", y="amount_gbp", title="Top 10 Suppliers by Payment Amount")
 st.plotly_chart(fig1)
 
-# --------------------------
-# 8. Payments over time
-# --------------------------
-progress_bar.progress(80, text="Processing payments over time...")
+# 11. Payments over time
+progress_bar.progress(86, text="Processing payments over time...")
 df['payment_date'] = pd.to_datetime(df['payment_date'])
 payments_by_month = df.groupby(df['payment_date'].dt.to_period("M"))['amount_gbp'].sum().reset_index()
 payments_by_month['payment_date'] = payments_by_month['payment_date'].dt.to_timestamp()
 fig2 = px.line(payments_by_month, x="payment_date", y="amount_gbp", title="Payments Over Time")
 st.plotly_chart(fig2)
 
-# --------------------------
-# 9. Map visualization
-# --------------------------
-progress_bar.progress(82, text="Preparing map visualization...")
+# 12. Map visualization
+progress_bar.progress(88, text="Preparing map visualization...")
 df_map = df.dropna(subset=['lat','lon'])
 if not df_map.empty:
     st.subheader("Payments Map")
@@ -220,10 +197,8 @@ if not df_map.empty:
     )
     st.plotly_chart(fig_map)
 
-# --------------------------
-# 10. Anomaly detection with filters
-# --------------------------
-progress_bar.progress(84, text="Detecting anomalies...")
+# 13. Anomaly detection with filters
+progress_bar.progress(90, text="Detecting anomalies...")
 st.subheader("Anomalies / Alerts")
 anomaly_options = [
     "Large payments (>£100k)",
@@ -300,12 +275,10 @@ if "Single supplier dominance" in selected_anomalies:
 
 conn.close()
 
-progress_bar.progress(90, text="Anomaly detection complete.")
+progress_bar.progress(93, text="Anomaly detection complete.")
 
-# --------------------------
-# 11. Citizen feedback
-# --------------------------
-progress_bar.progress(92, text="Loading citizen feedback...")
+# 14. Citizen feedback
+progress_bar.progress(95, text="Loading citizen feedback...")
 st.subheader("Citizen Feedback")
 
 conn = sqlite3.connect(DB_NAME)
@@ -334,9 +307,7 @@ if not feedback_df.empty:
 
 progress_bar.progress(98, text="Citizen feedback loaded.")
 
-# --------------------------
-# 12. CSV download
-# --------------------------
+# 15. CSV download
 progress_bar.progress(100, text="All data loaded!")
 csv_data = df.to_csv(index=False).encode('utf-8')
 st.download_button(label="Download CSV", data=csv_data, file_name=f"{selected_council}_payments.csv", mime="text/csv")
