@@ -8,45 +8,62 @@ from pattern_detection import detect_anomalies
 from council_auto_discovery import discover_new_councils, fetch_new_council_csv
 from geocode import geocode_address
 import plotly.express as px
+import time
 
 DB_NAME = "spend.db"
 
 # --------------------------
 # Initialize database
 # --------------------------
-create_tables()
+with st.spinner("Setting up database..."):
+    create_tables()
 
 # --------------------------
 # Sidebar: Council selection
 # --------------------------
 st.sidebar.title("Public Spending Tracker")
 
-# Discover and ingest new councils automatically
-new_councils = discover_new_councils()
-for council_name, csv_url in new_councils:
-    records = fetch_new_council_csv(csv_url, council_name)
-    insert_records(records)
+# --------------------------
+# Progress bar and status
+# --------------------------
+progress_text = "Starting up, please wait..."
+progress_bar = st.sidebar.progress(0, text=progress_text)
 
-# Fetch list of councils from DB
+# 1. Discover and ingest new councils automatically
+progress_bar.progress(5, text="Discovering new councils...")
+new_councils = discover_new_councils()
+if new_councils:
+    for i, (council_name, csv_url) in enumerate(new_councils, 1):
+        progress_bar.progress(5 + int(i * (15/len(new_councils))), text=f"Ingesting data for: {council_name}")
+        records = fetch_new_council_csv(csv_url, council_name)
+        insert_records(records)
+        time.sleep(0.1)  # Simulate some wait time for user feedback
+else:
+    progress_bar.progress(20, text="No new councils discovered.")
+
+# 2. Fetch list of councils from DB
+progress_bar.progress(25, text="Fetching list of councils...")
 conn = sqlite3.connect(DB_NAME)
 c = conn.cursor()
 c.execute("SELECT DISTINCT council FROM payments")
 councils = [row[0] for row in c.fetchall()]
 conn.close()
 
+if not councils:
+    st.error("No councils found in database. Please check your data source.")
+    st.stop()
+
 selected_council = st.sidebar.selectbox("Select council", sorted(councils))
 
-# --------------------------
-# Filters
-# --------------------------
+# 3. Filters
+progress_bar.progress(30, text="Loading filters...")
 st.sidebar.subheader("Filters")
 start_date = st.sidebar.date_input("Start date", datetime(2023,1,1))
 end_date = st.sidebar.date_input("End date", datetime.today())
 supplier_search = st.sidebar.text_input("Supplier search")
 
-# --------------------------
-# Fetch filtered data
-# --------------------------
+# 4. Fetch filtered data
+progress_bar.progress(40, text="Fetching payments data...")
 conn = sqlite3.connect(DB_NAME)
 query = "SELECT * FROM payments WHERE council = ? AND payment_date BETWEEN ? AND ?"
 params = [selected_council, start_date.isoformat(), end_date.isoformat()]
@@ -56,34 +73,31 @@ if supplier_search:
 
 df = pd.read_sql_query(query, conn, params=params)
 conn.close()
+progress_bar.progress(55, text="Payments data loaded.")
 
-# --------------------------
-# Display summary stats
-# --------------------------
+# 5. Display summary stats
+progress_bar.progress(60, text="Calculating summary statistics...")
 st.title(f"{selected_council} Public Spending")
 st.markdown(f"Showing payments from {start_date} to {end_date}")
 st.write(f"**Total payments:** £{df['amount_gbp'].sum():,.2f}")
 st.write(f"**Number of transactions:** {len(df)}")
 
-# --------------------------
-# Top suppliers
-# --------------------------
+# 6. Top suppliers
+progress_bar.progress(65, text="Calculating top suppliers...")
 top_suppliers = df.groupby("supplier")['amount_gbp'].sum().sort_values(ascending=False).head(10).reset_index()
 fig1 = px.bar(top_suppliers, x="supplier", y="amount_gbp", title="Top 10 Suppliers by Payment Amount")
 st.plotly_chart(fig1)
 
-# --------------------------
-# Payments over time
-# --------------------------
+# 7. Payments over time
+progress_bar.progress(70, text="Processing payments over time...")
 df['payment_date'] = pd.to_datetime(df['payment_date'])
 payments_by_month = df.groupby(df['payment_date'].dt.to_period("M"))['amount_gbp'].sum().reset_index()
 payments_by_month['payment_date'] = payments_by_month['payment_date'].dt.to_timestamp()
 fig2 = px.line(payments_by_month, x="payment_date", y="amount_gbp", title="Payments Over Time")
 st.plotly_chart(fig2)
 
-# --------------------------
-# Map visualization
-# --------------------------
+# 8. Map visualization
+progress_bar.progress(75, text="Preparing map visualization...")
 df_map = df.dropna(subset=['lat','lon'])
 if not df_map.empty:
     st.subheader("Payments Map")
@@ -93,12 +107,9 @@ if not df_map.empty:
     )
     st.plotly_chart(fig_map)
 
-# --------------------------
-# Anomaly detection with filters
-# --------------------------
+# 9. Anomaly detection with filters
+progress_bar.progress(80, text="Detecting anomalies...")
 st.subheader("Anomalies / Alerts")
-
-# User filter selection
 anomaly_options = [
     "Large payments (>£100k)",
     "Frequent payments (>5 per month)",
@@ -174,9 +185,10 @@ if "Single supplier dominance" in selected_anomalies:
 
 conn.close()
 
-# --------------------------
-# Citizen feedback
-# --------------------------
+progress_bar.progress(90, text="Anomaly detection complete.")
+
+# 10. Citizen feedback
+progress_bar.progress(92, text="Loading citizen feedback...")
 st.subheader("Citizen Feedback")
 
 conn = sqlite3.connect(DB_NAME)
@@ -203,8 +215,12 @@ conn.close()
 if not feedback_df.empty:
     st.dataframe(feedback_df)
 
-# --------------------------
-# CSV download
-# --------------------------
+progress_bar.progress(98, text="Citizen feedback loaded.")
+
+# 11. CSV download
+progress_bar.progress(100, text="All data loaded!")
 csv_data = df.to_csv(index=False).encode('utf-8')
 st.download_button(label="Download CSV", data=csv_data, file_name=f"{selected_council}_payments.csv", mime="text/csv")
+
+# Remove the progress bar when done
+progress_bar.empty()
