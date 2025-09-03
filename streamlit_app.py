@@ -7,7 +7,6 @@ from db_schema import create_tables
 from pattern_detection import detect_anomalies
 from council_auto_discovery import discover_new_councils, fetch_new_council_csv
 from geocode import geocode_address
-import council_fetchers
 import plotly.express as px
 
 DB_NAME = "spend.db"
