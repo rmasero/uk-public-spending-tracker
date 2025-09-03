@@ -41,18 +41,17 @@ for idx, filepath in enumerate(fetcher_files):
         spec = importlib.util.spec_from_file_location("fetcher", filepath)
         fetcher = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fetcher)
-        council_name = fetcher.council_name
-        csv_url = fetcher.csv_url
-        predefined_councils.append((council_name, csv_url))
-    except Exception as e:
+        council_name = getattr(fetcher, "council_name", None)
+        csv_url = getattr(fetcher, "csv_url", None)
+        if council_name and csv_url:
+            predefined_councils.append((council_name, csv_url))
+    except Exception:
         # Don't show error, just skip
         pass
 
 # --------------------------
 # Helper for loading council data with timeout and one retry
 # --------------------------
-import requests
-
 def try_fetch_new_council_csv(csv_url, council_name, timeout=15):
     try:
         return fetch_new_council_csv(csv_url, council_name, timeout=timeout)
