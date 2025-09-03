@@ -65,43 +65,5 @@ supplier_search = st.sidebar.text_input("Supplier search")
 # Fetch filtered data
 # --------------------------
 conn = sqlite3.connect(DB_NAME)
-query = "SELECT * FROM payments WHERE council = ? AND payment_date BETWEEN ? AND ?"
-params = [selected_council, start_date.isoformat(), end_date.isoformat()]
-if supplier_search:
-    query += " AND supplier LIKE ?"
-    params.append(f"%{supplier_search}%")
-
-df = pd.read_sql_query(query, conn, params=params)
-conn.close()
-
-# --------------------------
-# Display summary stats
-# --------------------------
-st.title(f"{selected_council} Public Spending")
-st.markdown(f"Showing payments from {start_date} to {end_date}")
-st.write(f"**Total payments:** £{df['amount_gbp'].sum():,.2f}")
-st.write(f"**Number of transactions:** {len(df)}")
-
-# --------------------------
-# Top suppliers
-# --------------------------
-top_suppliers = df.groupby("supplier")['amount_gbp'].sum().sort_values(ascending=False).head(10).reset_index()
-fig1 = px.bar(top_suppliers, x="supplier", y="amount_gbp", title="Top 10 Suppliers by Payment Amount")
-st.plotly_chart(fig1)
-
-# --------------------------
-# Payments over time
-# --------------------------
-df['payment_date'] = pd.to_datetime(df['payment_date'])
-payments_by_month = df.groupby(df['payment_date'].dt.to_period("M"))['amount_gbp'].sum().reset_index()
-payments_by_month['payment_date'] = payments_by_month['payment_date'].dt.to_timestamp()
-fig2 = px.line(payments_by_month, x="payment_date", y="amount_gbp", title="Payments Over Time")
-st.plotly_chart(fig2)
-
-# --------------------------
-# Map visualization
-# --------------------------
-df_map = df.dropna(subset=['lat','lon'])
-if not df_map.empty:
-   
+query = "SELECT * FROM payments WHERE council = ? AND payment_date BETWEEN ? AND ?*
 
