@@ -1,346 +1,265 @@
-import streamlit as st
-import pandas as pd
-import sqlite3
-from datetime import datetime
-from fetch_and_ingest import insert_records
-from db_schema import create_tables
-from pattern_detection import detect_anomalies
-from council_auto_discovery import discover_new_councils, fetch_new_council_csv
-from geocode import geocode_address
-import plotly.express as px
+import os
 import glob
 import importlib.util
-import os
-import time
+import sqlite3
+from datetime import date
+from typing import List, Tuple
 
-DB_NAME = "spend.db"
+import pandas as pd
+import plotly.express as px
+import streamlit as st
 
-# --------------------------
-# Initialize database
-# --------------------------
-with st.spinner("Setting up database..."):
+from db_schema import create_tables, DB_NAME
+from fetch_and_ingest import insert_records
+from council_auto_discovery import discover_new_councils, fetch_new_council_csv
+
+st.set_page_config(page_title="UK Public Spending Tracker", layout="wide")
+st.title("UK Public Spending Tracker")
+
+@st.cache_data(show_spinner=False)
+def _connect():
+    return sqlite3.connect(DB_NAME)
+
+def _query_df(sql: str, params: tuple = ()):
+    conn = _connect()
+    return pd.read_sql_query(sql, conn, params=params)
+
+def _get_councils() -> List[str]:
+    df = _query_df("SELECT DISTINCT council FROM payments ORDER BY council;")
+    return df["council"].tolist()
+
+def _load_predefined_councils() -> List[Tuple[str, str, callable]]:
+    """Return list of (name, csv_url, fetch_fn|None)."""
+    fetcher_dir = "council_fetchers"
+    files = sorted([f for f in glob.glob(os.path.join(fetcher_dir, "*.py")) if not f.endswith("__init__.py")])
+    items = []
+    for path in files:
+        spec = importlib.util.spec_from_file_location("cmod", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore
+        name = getattr(mod, "council_name", os.path.basename(path).replace(".py", "").title())
+        csv_url = getattr(mod, "csv_url", None)
+        fetch_fn = getattr(mod, "fetch_payments", None)
+        items.append((name, csv_url, fetch_fn))
+    return items
+
+with st.spinner("Setting up database…"):
     create_tables()
 
-st.sidebar.title("Public Spending Tracker")
-progress_text = "Starting up, please wait..."
-progress_bar = st.sidebar.progress(0, text=progress_text)
+st.sidebar.header("Data controls")
+refresh = st.sidebar.button("Refresh all data (free sources)", type="primary")
+geocode_toggle = st.sidebar.checkbox("Geocode suppliers on import (slow; free Nominatim)", value=False)
 
-# --------------------------
-# Load council fetchers (predefined councils) first
-# --------------------------
-progress_bar.progress(2, text="Locating predefined councils...")
-COUNCIL_FETCHERS_DIR = "council_fetchers"
-fetcher_files = sorted(
-    [f for f in glob.glob(os.path.join(COUNCIL_FETCHERS_DIR, "*.py")) if not f.endswith("__init__.py")]
-)
-predefined_councils = []
+if refresh:
+    progress = st.sidebar.progress(0, text="Refreshing data…")
+    inserted_total = skipped_total = 0
 
-# Import council_name, csv_url, and fetch_payments if available from each fetcher
-for filepath in fetcher_files:
+    # 1) Predefined councils (custom fetchers)
+    items = _load_predefined_councils()
+    for i, (name, csv_url, fetch_fn) in enumerate(items, start=1):
+        progress.progress(int(10 + (i / max(1, len(items))) * 40), text=f"Fetching: {name}")
+        try:
+            if callable(fetch_fn):
+                records = fetch_fn()
+            elif csv_url:
+                records = fetch_new_council_csv(csv_url, name)
+            else:
+                records = []
+            ins, skip = insert_records(records, do_geocode=geocode_toggle)
+            inserted_total += ins
+            skipped_total += skip
+        except Exception as e:
+            st.warning(f"Failed to import {name}: {e}")
+
+    # 2) Discover more councils via data.gov.uk
     try:
-        spec = importlib.util.spec_from_file_location("fetcher", filepath)
-        fetcher = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(fetcher)
-        council_name = getattr(fetcher, "council_name", None)
-        csv_url = getattr(fetcher, "csv_url", None)
-        # Store also the fetch_payments function if it exists
-        fetch_payments_func = getattr(fetcher, "fetch_payments", None)
-        if council_name and csv_url:
-            predefined_councils.append(
-                {
-                    "council_name": council_name,
-                    "csv_url": csv_url,
-                    "fetcher_path": filepath,
-                    "fetch_payments_func": fetch_payments_func,
-                }
-            )
+        discovered = discover_new_councils()
     except Exception as e:
-        # Don't show error, just skip
-        pass
+        discovered = []
+        st.info(f"Discovery skipped: {e}")
 
-def try_fetch_predefined_council(council):
-    """Try to fetch payments using custom fetch_payments, else fallback to generic CSV loader."""
-    records = None
-    try:
-        if council["fetch_payments_func"]:
-            # Custom fetcher
-            records = council["fetch_payments_func"]()
-        else:
-            # Fallback to generic CSV loader
-            records = fetch_new_council_csv(council["csv_url"], council["council_name"])
-    except Exception:
-        records = None
-    return records
+    for j, (name, url) in enumerate(discovered, start=1):
+        progress.progress(int(55 + (j / max(1, len(discovered))) * 35), text=f"Importing discovered: {name}")
+        try:
+            records = fetch_new_council_csv(url, name)
+            # Keep discovery fast; geocoding can be re-run later
+            ins, skip = insert_records(records, do_geocode=False)
+            inserted_total += ins
+            skipped_total += skip
+        except Exception:
+            continue
 
-def try_fetch_new_council_csv(csv_url, council_name, timeout=15):
-    try:
-        return fetch_new_council_csv(csv_url, council_name, timeout=timeout)
-    except Exception:
-        return None
+    progress.progress(96, text="Finalizing…")
+    st.success(f"Refresh complete. Inserted {inserted_total:,} new rows; skipped {skipped_total:,} (dupes/unparseable).")
 
-def load_council_data(councils, progress_start, progress_range, desc_prefix, predefined=False):
-    failed = []
-    total = len(councils)
-    for i, council in enumerate(councils):
-        pct = progress_start + int(i * (progress_range / max(1, total)))
-        progress_bar.progress(pct, text=f"{desc_prefix} {council['council_name'] if predefined else council[0]}...")
-        if predefined:
-            records = try_fetch_predefined_council(council)
-            name = council["council_name"]
-            url = council["csv_url"]
-        else:
-            name, url = council
-            records = try_fetch_new_council_csv(url, name)
-        if records:
-            insert_records(records)
-        else:
-            failed.append(council)
-        time.sleep(0.05)
-    return failed
-
-# Load predefined councils first (custom fetchers take precedence)
-failed_predefined = load_council_data(predefined_councils, 2, 23, "Loading predefined council:", predefined=True)
-
-# --------------------------
-# Discover and load new councils (round 1)
-# --------------------------
-progress_bar.progress(25, text="Discovering new councils...")
-all_new_councils = discover_new_councils()
-predef_names = set(c["council_name"] for c in predefined_councils)
-new_councils = [(name, url) for name, url in all_new_councils if name not in predef_names]
-failed_new = load_council_data(new_councils, 25, 15, "Loading new council:")
-
-# --------------------------
-# Retry failed councils only once after all others
-# --------------------------
-failed_all = failed_predefined + failed_new
-if failed_all:
-    progress_bar.progress(40, text="Retrying failed council loads...")
-    if failed_predefined:
-        # Retry predefined with custom logic
-        failed_retry_predef = load_council_data(failed_predefined, 40, 3, "Retrying council:", predefined=True)
-    else:
-        failed_retry_predef = []
-    # Retry new councils
-    failed_retry_new = load_council_data(failed_new, 43, 2, "Retrying council:", predefined=False)
-    failed_retry = failed_retry_predef + failed_retry_new
-else:
-    failed_retry = []
-
-# --------------------------
-# Loop: automatically look for more new councils after all others are loaded
-# Only do this once more to avoid infinite loops (could be more if you want)
-# --------------------------
-progress_bar.progress(45, text="Scanning for additional councils...")
-more_new_councils = discover_new_councils()
-already_seen = set(list(predef_names) + [name for name, _ in new_councils] + [c["council_name"] if isinstance(c, dict) else c[0] for c in failed_all])
-to_load = [(name, url) for name, url in more_new_councils if name not in already_seen]
-load_council_data(to_load, 45, 5, "Loading additional council:")
-
-progress_bar.progress(50, text="Fetching list of councils...")
-# --------------------------
-# Fetch list of councils from DB
-# --------------------------
-conn = sqlite3.connect(DB_NAME)
-c = conn.cursor()
-c.execute("SELECT DISTINCT council FROM payments")
-councils = [row[0] for row in c.fetchall()]
-conn.close()
-
+# Filters
+st.sidebar.subheader("Filters")
+councils = _get_councils()
 if not councils:
-    st.error("No councils found in database. Please check your data source.")
+    st.info("No data yet. Click **Refresh all data** to import from free council CSVs.")
     st.stop()
 
-selected_council = st.sidebar.selectbox("Select council", sorted(councils))
+sel_council = st.sidebar.selectbox("Council", councils, index=0)
+start_date = st.sidebar.date_input("Start date", value=date(2023, 1, 1))
+end_date = st.sidebar.date_input("End date", value=date.today())
+supplier_query = st.sidebar.text_input("Supplier contains", "")
 
-# --------------------------
-# Filters
-# --------------------------
-progress_bar.progress(55, text="Loading filters...")
-st.sidebar.subheader("Filters")
-start_date = st.sidebar.date_input("Start date", datetime(2023,1,1))
-end_date = st.sidebar.date_input("End date", datetime.today())
-supplier_search = st.sidebar.text_input("Supplier search")
+params = [sel_council, start_date.isoformat(), end_date.isoformat()]
+sql = """
+SELECT * FROM payments
+WHERE council = ?
+  AND payment_date BETWEEN ? AND ?
+"""
+if supplier_query.strip():
+    sql += " AND lower(supplier) LIKE ?"
+    params.append(f"%{supplier_query.lower()}%")
 
-# --------------------------
-# Fetch filtered data
-# --------------------------
-progress_bar.progress(60, text="Fetching payments data...")
-conn = sqlite3.connect(DB_NAME)
-query = "SELECT * FROM payments WHERE council = ? AND payment_date BETWEEN ? AND ?"
-params = [selected_council, start_date.isoformat(), end_date.isoformat()]
-if supplier_search:
-    query += " AND supplier LIKE ?"
-    params.append(f"%{supplier_search}%")
+df = _query_df(sql, tuple(params))
 
-df = pd.read_sql_query(query, conn, params=params)
-conn.close()
-progress_bar.progress(65, text="Payments data loaded.")
+# KPIs
+cols = st.columns(3)
+with cols[0]:
+    st.metric("Total paid", f"£{df['amount_gbp'].sum():,.2f}")
+with cols[1]:
+    st.metric("Transactions", f"{len(df):,}")
+with cols[2]:
+    ts = pd.to_datetime(df["payment_date"], errors="coerce")
+    if not ts.empty and ts.notna().any():
+        st.metric("Date range", f"{ts.min().date()} → {ts.max().date()}")
+    else:
+        st.metric("Date range", "—")
 
-# --------------------------
-# Display summary stats
-# --------------------------
-progress_bar.progress(70, text="Calculating summary statistics...")
-st.title(f"{selected_council} Public Spending")
-st.markdown(f"Showing payments from {start_date} to {end_date}")
-st.write(f"**Total payments:** £{df['amount_gbp'].sum():,.2f}")
-st.write(f"**Number of transactions:** {len(df)}")
+# Charts
+if df.empty:
+    st.warning("No rows match your filters.")
+else:
+    left, right = st.columns(2)
+    with left:
+        sup = (
+            df.groupby("supplier", dropna=False, as_index=False)["amount_gbp"]
+            .sum()
+            .sort_values("amount_gbp", ascending=False)
+            .head(10)
+        )
+        st.plotly_chart(px.bar(sup, x="supplier", y="amount_gbp", title="Top suppliers (by £)"), use_container_width=True)
 
-# --------------------------
-# Top suppliers
-# --------------------------
-progress_bar.progress(75, text="Calculating top suppliers...")
-if not df.empty:
-    top_suppliers = df.groupby("supplier")['amount_gbp'].sum().sort_values(ascending=False).head(10).reset_index()
-    fig1 = px.bar(top_suppliers, x="supplier", y="amount_gbp", title="Top 10 Suppliers by Payment Amount")
-    st.plotly_chart(fig1)
+    with right:
+        dt = pd.to_datetime(df["payment_date"], errors="coerce")
+        df_time = (
+            df.assign(payment_month=dt.dt.to_period("M").dt.to_timestamp())
+            .groupby("payment_month", as_index=False)["amount_gbp"]
+            .sum()
+        )
+        st.plotly_chart(px.line(df_time, x="payment_month", y="amount_gbp", title="Payments over time"), use_container_width=True)
 
-# --------------------------
-# Payments over time
-# --------------------------
-progress_bar.progress(80, text="Processing payments over time...")
-if not df.empty:
-    df['payment_date'] = pd.to_datetime(df['payment_date'])
-    payments_by_month = df.groupby(df['payment_date'].dt.to_period("M"))['amount_gbp'].sum().reset_index()
-    payments_by_month['payment_date'] = payments_by_month['payment_date'].dt.to_timestamp()
-    fig2 = px.line(payments_by_month, x="payment_date", y="amount_gbp", title="Payments Over Time")
-    st.plotly_chart(fig2)
+    # Map if lat/lon available
+    if {"lat", "lon"}.issubset(df.columns) and df[["lat", "lon"]].notna().any().any():
+        figm = px.scatter_mapbox(
+            df.dropna(subset=["lat", "lon"]),
+            lat="lat",
+            lon="lon",
+            hover_name="supplier",
+            hover_data={"amount_gbp": ":.2f", "description": True, "lat": False, "lon": False},
+            size="amount_gbp",
+            zoom=5,
+            height=450,
+        )
+        figm.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=40, b=0), title="Geocoded payments")
+        st.plotly_chart(figm, use_container_width=True)
 
-# --------------------------
-# Map visualization
-# --------------------------
-progress_bar.progress(83, text="Preparing map visualization...")
-df_map = df.dropna(subset=['lat','lon']) if not df.empty else pd.DataFrame()
-if not df_map.empty:
-    st.subheader("Payments Map")
-    fig_map = px.scatter_mapbox(
-        df_map, lat="lat", lon="lon", hover_name="supplier", hover_data=["amount_gbp","description"],
-        color="amount_gbp", size="amount_gbp", zoom=8, mapbox_style="open-street-map"
-    )
-    st.plotly_chart(fig_map)
-
-# --------------------------
-# Anomaly detection with filters
-# --------------------------
-progress_bar.progress(85, text="Detecting anomalies...")
-st.subheader("Anomalies / Alerts")
-anomaly_options = [
-    "Large payments (>£100k)",
-    "Frequent payments (>5 per month)",
-    "Duplicate invoice numbers",
-    "Payments without invoices",
-    "Single supplier dominance"
-]
-selected_anomalies = st.multiselect("Select anomaly types to display", anomaly_options, default=anomaly_options)
-
-conn = sqlite3.connect(DB_NAME)
-c = conn.cursor()
-
-# Large payments
-if "Large payments (>£100k)" in selected_anomalies:
-    c.execute("SELECT id, council, supplier, amount_gbp, payment_date FROM payments WHERE amount_gbp > 100000")
-    large_df = pd.DataFrame(c.fetchall(), columns=["id","council","supplier","amount_gbp","payment_date"])
-    if not large_df.empty:
-        st.markdown("**Large payments (>£100k):**")
-        st.dataframe(large_df[large_df['council']==selected_council])
-
-# Frequent payments
-if "Frequent payments (>5 per month)" in selected_anomalies:
-    c.execute('''
-        SELECT id, council, supplier, COUNT(*) as count, SUM(amount_gbp) as total_amount
+# Anomalies / Alerts
+with st.expander("Anomalies / Alerts", expanded=False):
+    a1 = _query_df("""
+        SELECT id, council, supplier, amount_gbp, payment_date
         FROM payments
-        GROUP BY council, supplier, strftime('%Y-%m', payment_date)
-        HAVING count > 5
-    ''')
-    frequent_df = pd.DataFrame(c.fetchall(), columns=["id","council","supplier","count","total_amount"])
-    if not frequent_df.empty:
-        st.markdown("**Frequent payments (>5 per month):**")
-        st.dataframe(frequent_df[frequent_df['council']==selected_council])
+        WHERE council = ? AND amount_gbp > 100000
+        ORDER BY amount_gbp DESC
+    """, (sel_council,))
+    st.subheader("Large payments (> £100k)")
+    st.dataframe(a1, use_container_width=True)
 
-# Duplicate invoice numbers
-if "Duplicate invoice numbers" in selected_anomalies:
-    c.execute('''
-        SELECT invoice_ref, COUNT(*) as cnt, SUM(amount_gbp) as total_amount
-        FROM payments
-        WHERE invoice_ref != ''
-        GROUP BY invoice_ref
-        HAVING cnt > 1
-    ''')
-    dup_df = pd.DataFrame(c.fetchall(), columns=["invoice_ref","count","total_amount"])
-    if not dup_df.empty:
-        st.markdown("**Duplicate invoice numbers:**")
-        st.dataframe(dup_df)
-
-# Payments without invoices
-if "Payments without invoices" in selected_anomalies:
-    c.execute("SELECT * FROM payments WHERE invoice_ref IS NULL OR invoice_ref = ''")
-    missing_inv_df = pd.DataFrame(
-        c.fetchall(),
-        columns=["id","council","payment_date","supplier","description","category","amount_gbp","invoice_ref","lat","lon","hash"]
-    )
-    if not missing_inv_df.empty:
-        st.markdown("**Payments without invoices:**")
-        st.dataframe(missing_inv_df[missing_inv_df['council']==selected_council])
-
-# Single supplier dominance (>50% of total payments)
-if "Single supplier dominance" in selected_anomalies:
-    c.execute('''
-        SELECT supplier, SUM(amount_gbp) as total_amount
+    a2 = _query_df("""
+        SELECT council, supplier, strftime('%Y-%m', payment_date) AS ym, COUNT(*) AS cnt, SUM(amount_gbp) AS total
         FROM payments
         WHERE council = ?
-        GROUP BY supplier
-        ORDER BY total_amount DESC
+        GROUP BY council, supplier, ym
+        HAVING cnt > 5
+        ORDER BY cnt DESC
+    """, (sel_council,))
+    st.subheader("Frequent monthly payments (>5)")
+    st.dataframe(a2, use_container_width=True)
+
+    a3 = _query_df("""
+        SELECT invoice_ref, COUNT(*) AS cnt, SUM(amount_gbp) AS total
+        FROM payments
+        WHERE council = ? AND invoice_ref IS NOT NULL AND TRIM(invoice_ref) <> ''
+        GROUP BY invoice_ref
+        HAVING cnt > 1
+        ORDER BY cnt DESC
+    """, (sel_council,))
+    st.subheader("Duplicate invoice references")
+    st.dataframe(a3, use_container_width=True)
+
+    a4 = _query_df("""
+        SELECT id, supplier, amount_gbp, payment_date, description
+        FROM payments
+        WHERE council = ? AND (invoice_ref IS NULL OR TRIM(invoice_ref) = '')
+        ORDER BY payment_date DESC
+    """, (sel_council,))
+    st.subheader("Payments without invoice reference")
+    st.dataframe(a4, use_container_width=True)
+
+    dom = _query_df("""
+        WITH sums AS (
+            SELECT supplier, SUM(amount_gbp) AS total
+            FROM payments
+            WHERE council = ?
+            GROUP BY supplier
+        ), grand AS (
+            SELECT SUM(amount_gbp) AS gt FROM payments WHERE council = ?
+        )
+        SELECT s.supplier, s.total, g.gt, 100.0 * s.total / g.gt AS pct
+        FROM sums s, grand g
+        ORDER BY s.total DESC
         LIMIT 1
-    ''', (selected_council,))
-    row = c.fetchone()
-    if row:
-        supplier, total_amount = row
-        c.execute("SELECT SUM(amount_gbp) FROM payments WHERE council=?", (selected_council,))
-        total_council = c.fetchone()[0]
-        if total_council and total_amount and total_council > 0 and (total_amount/total_council) > 0.5:
-            st.markdown(f"**Warning:** Supplier `{supplier}` received more than 50% of total payments (£{total_amount:,.2f})")
+    """, (sel_council, sel_council))
+    if not dom.empty and float(dom["pct"].iloc[0]) > 50.0:
+        st.error(f"Supplier dominance: {dom['supplier'].iloc[0]} accounts for {dom['pct'].iloc[0]:.1f}% of spend (£{dom['total'].iloc[0]:,.0f}).")
 
-conn.close()
-progress_bar.progress(90, text="Anomaly detection complete.")
-
-# --------------------------
-# Citizen feedback
-# --------------------------
-progress_bar.progress(92, text="Loading citizen feedback...")
-st.subheader("Citizen Feedback")
-
-conn = sqlite3.connect(DB_NAME)
-c = conn.cursor()
-
-# Submit feedback
-with st.form("feedback_form"):
-    payment_id = st.number_input("Payment ID to comment on", min_value=1, step=1)
-    user_name = st.text_input("Your name")
+# Feedback form
+st.header("Citizen feedback")
+with st.form("feedback"):
+    pid = st.number_input("Payment ID", min_value=1, step=1)
+    uname = st.text_input("Your name (optional)")
     comment = st.text_area("Comment")
-    rating = st.slider("Rating (1-5)", 1, 5, 3)
-    submitted = st.form_submit_button("Submit Feedback")
+    rating = st.slider("Rating", 1, 5, 3)
+    submitted = st.form_submit_button("Submit feedback")
     if submitted:
-        c.execute("INSERT INTO feedback (payment_id,user_name,comment,rating) VALUES (?,?,?,?)",
-                  (payment_id,user_name,comment,rating))
+        conn = _connect()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO feedback (payment_id, user_name, comment, rating) VALUES (?,?,?,?)",
+            (int(pid), uname.strip(), comment.strip(), int(rating)),
+        )
         conn.commit()
-        st.success("Feedback submitted!")
+        st.success("Thanks! Your feedback has been recorded.")
 
-# Display feedback
-c.execute("SELECT * FROM feedback WHERE payment_id IN (SELECT id FROM payments WHERE council=?) ORDER BY created_at DESC", (selected_council,))
-feedback_df = pd.DataFrame(c.fetchall(), columns=["id","payment_id","user_name","comment","rating","created_at"])
-conn.close()
+fb = _query_df("""
+    SELECT f.created_at, f.payment_id, f.user_name, f.comment, f.rating
+    FROM feedback f
+    WHERE f.payment_id IN (SELECT id FROM payments WHERE council = ?)
+    ORDER BY f.created_at DESC
+    LIMIT 200
+""", (sel_council,))
+if not fb.empty:
+    st.subheader("Recent feedback")
+    st.dataframe(fb, use_container_width=True)
 
-if not feedback_df.empty:
-    st.dataframe(feedback_df)
-
-progress_bar.progress(98, text="Citizen feedback loaded.")
-
-# --------------------------
-# CSV download
-# --------------------------
-progress_bar.progress(100, text="All data loaded!")
+# CSV export
 if not df.empty:
-    csv_data = df.to_csv(index=False).encode('utf-8')
-    st.download_button(label="Download CSV", data=csv_data, file_name=f"{selected_council}_payments.csv", mime="text/csv")
-
-progress_bar.empty()
+    st.download_button(
+        "Download filtered CSV",
+        df.to_csv(index=False).encode("utf-8"),
+        file_name=f"{sel_council}_payments.csv",
+        mime="text/csv",
+    )
