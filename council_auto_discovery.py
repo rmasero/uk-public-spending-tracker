@@ -1,24 +1,23 @@
-import requests
-import pandas as pd
+import time
 from io import BytesIO
 from typing import List, Tuple
+
+import pandas as pd
+import requests
+
 from council_fetchers import FETCHERS
+from councils_catalog import build_catalog, load_catalog
 
-# Free public CKAN API for UK data
-DATA_GOV_API_URL = (
-    "https://ckan.publishing.service.gov.uk/api/3/action/package_search"
-    "?q=payments+to+suppliers&rows=50"
-)
-
-def fetch_new_council_csv(url: str, council_name: str) -> list:
+def fetch_new_council_csv(url: str, council_name: str, timeout: int = 10) -> list:
     """
     Generic CSV fetcher for councils without a custom parser.
     Returns a list of dicts with normalized keys.
     """
-    if council_name in FETCHERS:
+    # Respect custom fetchers if available
+    if council_name in FETCHERS and callable(FETCHERS[council_name]):
         return FETCHERS[council_name]()
 
-    r = requests.get(url, timeout=30)
+    r = requests.get(url, timeout=timeout)
     r.raise_for_status()
     content = r.content
     try:
@@ -32,7 +31,7 @@ def fetch_new_council_csv(url: str, council_name: str) -> list:
         "supplier": ["supplier", "Supplier", "Supplier Name", "supplier_name"],
         "description": ["description", "Description", "purpose", "Purpose"],
         "category": ["category", "Department", "Service Area", "Cost Centre", "ServiceArea"],
-        "amount_gbp": ["amount", "Amount", "Amount Paid", "AmountPaid", "Net Amount"],
+        "amount_gbp": ["amount", "Amount", "Amount Paid", "AmountPaid", "Net Amount", "Gross Amount"],
         "invoice_ref": ["invoice", "Invoice", "Invoice Ref", "InvoiceRef", "invoice_number", "Invoice Number"],
     }
 
@@ -65,16 +64,15 @@ def fetch_new_council_csv(url: str, council_name: str) -> list:
 
 def discover_new_councils() -> List[Tuple[str, str]]:
     """
-    Query data.gov.uk and return [(name, csv_url)]
+    Return [(council_name, csv_url)] for all councils discovered via the cached or freshly-built catalog.
     """
-    r = requests.get(DATA_GOV_API_URL, timeout=30)
-    r.raise_for_status()
-    results = r.json().get("result", {}).get("results", [])
-    discovered = []
-    for pkg in results:
-        name = pkg.get("title")
-        for res in pkg.get("resources", []):
-            if str(res.get("format", "")).lower() == "csv" and res.get("url"):
-                discovered.append((name, res["url"]))
-                break
-    return discovered
+    catalog = load_catalog()
+    if not catalog:
+        # Build with pagination (free CKAN API)
+        catalog = build_catalog()
+
+    pairs: List[Tuple[str, str]] = []
+    for council, payload in catalog.items():
+        for url in payload.get("csv_urls", []):
+            pairs.append((council, url))
+    return pairs
