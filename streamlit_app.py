@@ -19,7 +19,7 @@ create_tables()
 # --------------------------
 # Sidebar: Council selection
 # --------------------------
-st.sidebar.title("Public Spending Tracker")
+st.sidebar.title("UK Public Spending Tracker")
 
 # Try to discover and ingest new councils with progress indicator
 with st.spinner("Discovering and loading council data..."):
