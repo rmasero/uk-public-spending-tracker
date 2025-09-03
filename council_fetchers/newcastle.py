@@ -3,7 +3,7 @@ import requests
 from io import BytesIO
 
 council_name = "Newcastle"
-csv_url = "https://www.newcastle.gov.uk/open-data/payments.csv"
+csv_url = "https://"
 
 def fetch_payments():
     url = csv_url
