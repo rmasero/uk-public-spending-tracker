@@ -16,6 +16,7 @@ from council_auto_discovery import discover_new_councils, fetch_new_council_csv
 st.set_page_config(page_title="UK Public Spending Tracker", layout="wide")
 st.title("UK Public Spending Tracker")
 
+# ---- DB helpers ----
 @st.cache_data(show_spinner=False)
 def _connect():
     return sqlite3.connect(DB_NAME)
@@ -43,13 +44,20 @@ def _load_predefined_councils() -> List[Tuple[str, str, callable]]:
         items.append((name, csv_url, fetch_fn))
     return items
 
-def _refresh_all_data(do_geocode: bool = False) -> Tuple[int, int]:
-    """Refresh data from all councils. Returns (inserted, skipped)."""
+# ---- Data load routine ----
+def load_all_data(do_geocode: bool = False) -> Tuple[int, int]:
+    """
+    Fetch all council data (predefined + discovered).
+    Returns (inserted, skipped).
+    """
     inserted_total = skipped_total = 0
+    progress = st.sidebar.progress(0, text="Starting import…")
 
     # 1) Predefined councils
     items = _load_predefined_councils()
-    for (name, csv_url, fetch_fn) in items:
+    for i, (name, csv_url, fetch_fn) in enumerate(items, start=1):
+        pct = int((i / max(1, len(items))) * 40)
+        progress.progress(pct, text=f"Fetching: {name}")
         try:
             if callable(fetch_fn):
                 records = fetch_fn()
@@ -63,49 +71,53 @@ def _refresh_all_data(do_geocode: bool = False) -> Tuple[int, int]:
         except Exception as e:
             st.warning(f"Failed to import {name}: {e}")
 
-    # 2) Discover more councils
+    # 2) Discover new councils
     try:
         discovered = discover_new_councils()
     except Exception as e:
         discovered = []
         st.info(f"Discovery skipped: {e}")
 
-    for (name, url) in discovered:
+    for j, (name, url) in enumerate(discovered, start=1):
+        pct = 40 + int((j / max(1, len(discovered))) * 50)
+        progress.progress(pct, text=f"Importing discovered: {name}")
         try:
             records = fetch_new_council_csv(url, name)
-            # keep discovery fast: no geocoding unless button pressed
-            ins, skip = insert_records(records, do_geocode=False)
+            ins, skip = insert_records(records, do_geocode=False if not do_geocode else True)
             inserted_total += ins
             skipped_total += skip
         except Exception:
             continue
 
+    progress.progress(100, text="Done.")
     return inserted_total, skipped_total
 
+# ---- Setup ----
 with st.spinner("Setting up database…"):
     create_tables()
 
-# --- Automatic refresh on start (without geocode) ---
-if "auto_refreshed" not in st.session_state:
-    st.session_state["auto_refreshed"] = True
-    with st.spinner("Auto-refreshing data (without geocoding)…"):
-        ins, skip = _refresh_all_data(do_geocode=False)
-    st.success(f"Auto-refresh complete. Inserted {ins:,} new rows; skipped {skip:,} (dupes/unparseable).")
+# ---- Auto-load data on start (fast, no geocode) ----
+if "data_loaded" not in st.session_state:
+    st.info("Loading council data (no geocoding, for speed)…")
+    ins, skip = load_all_data(do_geocode=False)
+    st.success(f"Initial load complete. {ins:,} new rows; {skip:,} skipped.")
+    st.session_state["data_loaded"] = True
 
-# --- Sidebar controls ---
+# ---- Sidebar controls ----
 st.sidebar.header("Data controls")
-st.sidebar.markdown("⚠️ Refresh with **geocoding** will be **slow** because free Nominatim limits lookups.")
+st.sidebar.warning("⚠ Refresh with geocoding is **slow** (due to free geocoding rate limits).")
+refresh = st.sidebar.button("Refresh all data (with geocoding)", type="primary")
 
-if st.sidebar.button("Refresh all data **with geocoding**", type="primary"):
-    with st.spinner("Refreshing with geocoding (may take a while)…"):
-        ins, skip = _refresh_all_data(do_geocode=True)
-    st.success(f"Refresh with geocoding complete. Inserted {ins:,} rows; skipped {skip:,}.")
+if refresh:
+    st.info("Refreshing all data with geocoding enabled (this may take several minutes)…")
+    ins, skip = load_all_data(do_geocode=True)
+    st.success(f"Refresh complete. {ins:,} new rows; {skip:,} skipped.")
 
-# --- Filters ---
+# ---- Filters ----
 st.sidebar.subheader("Filters")
 councils = _get_councils()
 if not councils:
-    st.info("No data available. Try refreshing data.")
+    st.info("No data available. Try refreshing.")
     st.stop()
 
 sel_council = st.sidebar.selectbox("Council", councils, index=0)
@@ -125,7 +137,7 @@ if supplier_query.strip():
 
 df = _query_df(sql, tuple(params))
 
-# --- KPIs ---
+# ---- KPIs ----
 cols = st.columns(3)
 with cols[0]:
     st.metric("Total paid", f"£{df['amount_gbp'].sum():,.2f}")
@@ -138,7 +150,7 @@ with cols[2]:
     else:
         st.metric("Date range", "—")
 
-# --- Charts ---
+# ---- Charts ----
 if df.empty:
     st.warning("No rows match your filters.")
 else:
@@ -161,7 +173,7 @@ else:
         )
         st.plotly_chart(px.line(df_time, x="payment_month", y="amount_gbp", title="Payments over time"), use_container_width=True)
 
-    # Map
+    # Map if lat/lon available
     if {"lat", "lon"}.issubset(df.columns) and df[["lat", "lon"]].notna().any().any():
         figm = px.scatter_mapbox(
             df.dropna(subset=["lat", "lon"]),
@@ -176,7 +188,7 @@ else:
         figm.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=40, b=0), title="Geocoded payments")
         st.plotly_chart(figm, use_container_width=True)
 
-# --- Anomalies / Alerts ---
+# ---- Anomalies / Alerts ----
 with st.expander("Anomalies / Alerts", expanded=False):
     a1 = _query_df("""
         SELECT id, council, supplier, amount_gbp, payment_date
@@ -235,7 +247,7 @@ with st.expander("Anomalies / Alerts", expanded=False):
     if not dom.empty and float(dom["pct"].iloc[0]) > 50.0:
         st.error(f"Supplier dominance: {dom['supplier'].iloc[0]} accounts for {dom['pct'].iloc[0]:.1f}% of spend (£{dom['total'].iloc[0]:,.0f}).")
 
-# --- Feedback form ---
+# ---- Feedback ----
 st.header("Citizen feedback")
 with st.form("feedback"):
     pid = st.number_input("Payment ID", min_value=1, step=1)
@@ -264,7 +276,7 @@ if not fb.empty:
     st.subheader("Recent feedback")
     st.dataframe(fb, use_container_width=True)
 
-# --- CSV export ---
+# ---- Export ----
 if not df.empty:
     st.download_button(
         "Download filtered CSV",
