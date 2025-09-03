@@ -1,0 +1,35 @@
+name: Monthly Data Update
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'  # Runs at midnight UTC on the 1st of each month
+  workflow_dispatch:      # Allows manual trigger too
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run data fetch
+        run: |
+          python fetch_and_ingest.py
+          
+      - name: Commit updated DB (if any)
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add spend.db
+          git commit -m "Monthly data update" || echo "No changes to commit"
+          git push origin main
