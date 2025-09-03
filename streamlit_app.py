@@ -2,93 +2,77 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 from datetime import datetime
-
-# Add debugging
-st.write("Debug: Starting app...")
-
-try:
-    from fetch_and_ingest import insert_records
-    st.write("✅ fetch_and_ingest imported successfully")
-except Exception as e:
-    st.error(f"❌ Error importing fetch_and_ingest: {e}")
-
-try:
-    from db_schema import create_tables
-    st.write("✅ db_schema imported successfully")
-except Exception as e:
-    st.error(f"❌ Error importing db_schema: {e}")
-
-try:
-    from pattern_detection import detect_anomalies
-    st.write("✅ pattern_detection imported successfully")
-except Exception as e:
-    st.error(f"❌ Error importing pattern_detection: {e}")
-
-try:
-    from council_auto_discovery import discover_new_councils, fetch_new_council_csv
-    st.write("✅ council_auto_discovery imported successfully")
-except Exception as e:
-    st.error(f"❌ Error importing council_auto_discovery: {e}")
-
-try:
-    from geocode import geocode_address
-    st.write("✅ geocode imported successfully")
-except Exception as e:
-    st.error(f"❌ Error importing geocode: {e}")
-
-try:
-    import plotly.express as px
-    st.write("✅ plotly imported successfully")
-except Exception as e:
-    st.error(f"❌ Error importing plotly: {e}")
+from fetch_and_ingest import insert_records
+from db_schema import create_tables
+from pattern_detection import detect_anomalies
+from council_auto_discovery import discover_new_councils, fetch_new_council_csv
+from geocode import geocode_address
+import plotly.express as px
 
 DB_NAME = "spend.db"
 
 # --------------------------
 # Initialize database
 # --------------------------
-try:
-    create_tables()
-    st.write("✅ Database tables created successfully")
-except Exception as e:
-    st.error(f"❌ Error creating database tables: {e}")
+create_tables()
 
 # --------------------------
 # Sidebar: Council selection
 # --------------------------
 st.sidebar.title("Public Spending Tracker")
 
-# Try to discover and ingest new councils
-try:
-    st.write("Debug: Discovering new councils...")
-    new_councils = discover_new_councils()
-    st.write(f"✅ Found {len(new_councils)} new councils")
-    
-    for council_name, csv_url in new_councils:
-        try:
-            records = fetch_new_council_csv(csv_url, council_name)
-            insert_records(records)
-            st.write(f"✅ Processed {council_name}: {len(records)} records")
-        except Exception as e:
-            st.write(f"⚠️ Error processing {council_name}: {e}")
+# Try to discover and ingest new councils with progress indicator
+with st.spinner("Discovering and loading council data..."):
+    try:
+        new_councils = discover_new_councils()
+        
+        if new_councils:
+            # Limit to first 10 councils to avoid long loading times
+            limited_councils = new_councils[:10]
             
-except Exception as e:
-    st.error(f"❌ Error in council discovery: {e}")
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            successful_loads = 0
+            total_councils = len(limited_councils)
+            
+            for i, (council_name, csv_url) in enumerate(limited_councils):
+                try:
+                    status_text.text(f"Processing {council_name}...")
+                    records = fetch_new_council_csv(csv_url, council_name, timeout=10)
+                    
+                    if records:
+                        insert_records(records)
+                        successful_loads += 1
+                        st.success(f"✅ Loaded {len(records)} records from {council_name}")
+                    else:
+                        st.warning(f"⚠️ No data found for {council_name}")
+                        
+                except Exception as e:
+                    st.warning(f"⚠️ Skipped {council_name}: {str(e)[:100]}")
+                
+                # Update progress
+                progress_bar.progress((i + 1) / total_councils)
+            
+            status_text.text(f"Completed! Successfully loaded {successful_loads}/{total_councils} councils")
+            progress_bar.empty()
+            status_text.empty()
+        else:
+            st.warning("No councils discovered from data.gov.uk API")
+            
+    except Exception as e:
+        st.error(f"Error in council discovery: {e}")
 
 # Fetch list of councils from DB
-try:
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT DISTINCT council FROM payments")
-    councils = [row[0] for row in c.fetchall()]
-    conn.close()
-    st.write(f"✅ Found {len(councils)} councils in database: {councils}")
-except Exception as e:
-    st.error(f"❌ Error fetching councils from database: {e}")
-    councils = []
+conn = sqlite3.connect(DB_NAME)
+c = conn.cursor()
+c.execute("SELECT DISTINCT council FROM payments")
+councils = [row[0] for row in c.fetchall()]
+conn.close()
 
 if not councils:
-    st.error("No councils found in database. The app cannot continue.")
+    st.error("No councils found in database. Please check the data sources.")
+    st.info("You may need to manually add some council data to get started.")
     st.stop()
 
 selected_council = st.sidebar.selectbox("Select council", sorted(councils))
@@ -104,74 +88,86 @@ supplier_search = st.sidebar.text_input("Supplier search")
 # --------------------------
 # Fetch filtered data
 # --------------------------
-try:
-    conn = sqlite3.connect(DB_NAME)
-    query = "SELECT * FROM payments WHERE council = ? AND payment_date BETWEEN ? AND ?"
-    params = [selected_council, start_date.isoformat(), end_date.isoformat()]
-    if supplier_search:
-        query += " AND supplier LIKE ?"
-        params.append(f"%{supplier_search}%")
+conn = sqlite3.connect(DB_NAME)
+query = "SELECT * FROM payments WHERE council = ? AND payment_date BETWEEN ? AND ?"
+params = [selected_council, start_date.isoformat(), end_date.isoformat()]
+if supplier_search:
+    query += " AND supplier LIKE ?"
+    params.append(f"%{supplier_search}%")
 
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
-    st.write(f"✅ Fetched {len(df)} payment records for {selected_council}")
-except Exception as e:
-    st.error(f"❌ Error fetching payment data: {e}")
-    st.stop()
+df = pd.read_sql_query(query, conn, params=params)
+conn.close()
 
 # --------------------------
 # Display summary stats
 # --------------------------
 st.title(f"{selected_council} Public Spending")
 st.markdown(f"Showing payments from {start_date} to {end_date}")
-st.write(f"**Total payments:** £{df['amount_gbp'].sum():,.2f}")
-st.write(f"**Number of transactions:** {len(df)}")
 
-# Only continue if we have data
 if len(df) == 0:
-    st.warning("No payment data found for the selected filters.")
-    st.stop()
+    st.warning("No payment data found for the selected council and date range.")
+    st.info("Try selecting a different council or expanding the date range.")
+else:
+    st.write(f"**Total payments:** £{df['amount_gbp'].sum():,.2f}")
+    st.write(f"**Number of transactions:** {len(df)}")
 
-# --------------------------
-# Top suppliers
-# --------------------------
-try:
-    top_suppliers = df.groupby("supplier")['amount_gbp'].sum().sort_values(ascending=False).head(10).reset_index()
-    fig1 = px.bar(top_suppliers, x="supplier", y="amount_gbp", title="Top 10 Suppliers by Payment Amount")
-    st.plotly_chart(fig1)
-    st.write("✅ Top suppliers chart created")
-except Exception as e:
-    st.error(f"❌ Error creating top suppliers chart: {e}")
+    # --------------------------
+    # Top suppliers
+    # --------------------------
+    if len(df) > 0:
+        top_suppliers = df.groupby("supplier")['amount_gbp'].sum().sort_values(ascending=False).head(10).reset_index()
+        fig1 = px.bar(top_suppliers, x="supplier", y="amount_gbp", title="Top 10 Suppliers by Payment Amount")
+        st.plotly_chart(fig1)
 
-# --------------------------
-# Payments over time
-# --------------------------
-try:
-    df['payment_date'] = pd.to_datetime(df['payment_date'])
-    payments_by_month = df.groupby(df['payment_date'].dt.to_period("M"))['amount_gbp'].sum().reset_index()
-    payments_by_month['payment_date'] = payments_by_month['payment_date'].dt.to_timestamp()
-    fig2 = px.line(payments_by_month, x="payment_date", y="amount_gbp", title="Payments Over Time")
-    st.plotly_chart(fig2)
-    st.write("✅ Payments over time chart created")
-except Exception as e:
-    st.error(f"❌ Error creating payments over time chart: {e}")
+        # --------------------------
+        # Payments over time
+        # --------------------------
+        df['payment_date'] = pd.to_datetime(df['payment_date'], errors='coerce')
+        df_valid_dates = df.dropna(subset=['payment_date'])
+        
+        if len(df_valid_dates) > 0:
+            payments_by_month = df_valid_dates.groupby(df_valid_dates['payment_date'].dt.to_period("M"))['amount_gbp'].sum().reset_index()
+            payments_by_month['payment_date'] = payments_by_month['payment_date'].dt.to_timestamp()
+            fig2 = px.line(payments_by_month, x="payment_date", y="amount_gbp", title="Payments Over Time")
+            st.plotly_chart(fig2)
 
-# --------------------------
-# Map visualization
-# --------------------------
-try:
-    df_map = df.dropna(subset=['lat','lon'])
-    if not df_map.empty:
-        st.subheader("Payments Map")
-        fig_map = px.scatter_mapbox(
-            df_map, lat="lat", lon="lon", hover_name="supplier", hover_data=["amount_gbp","description"],
-            color="amount_gbp", size="amount_gbp", zoom=8, mapbox_style="open-street-map"
+        # --------------------------
+        # Map visualization
+        # --------------------------
+        df_map = df.dropna(subset=['lat','lon'])
+        if not df_map.empty:
+            st.subheader("Payments Map")
+            fig_map = px.scatter_mapbox(
+                df_map, lat="lat", lon="lon", hover_name="supplier", hover_data=["amount_gbp","description"],
+                color="amount_gbp", size="amount_gbp", zoom=8, mapbox_style="open-street-map"
+            )
+            st.plotly_chart(fig_map)
+
+        # --------------------------
+        # Anomaly detection
+        # --------------------------
+        st.subheader("Anomalies / Alerts")
+        
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        
+        # Large payments
+        c.execute("SELECT id, council, supplier, amount_gbp, payment_date FROM payments WHERE amount_gbp > 100000 AND council = ?", (selected_council,))
+        large_payments = c.fetchall()
+        if large_payments:
+            st.markdown("**Large payments (>£100k):**")
+            large_df = pd.DataFrame(large_payments, columns=["id","council","supplier","amount_gbp","payment_date"])
+            st.dataframe(large_df)
+
+        conn.close()
+
+        # --------------------------
+        # CSV download
+        # --------------------------
+        csv_data = df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Download CSV", 
+            data=csv_data, 
+            file_name=f"{selected_council}_payments.csv", 
+            mime="text/csv"
         )
-        st.plotly_chart(fig_map)
-        st.write("✅ Map visualization created")
-    else:
-        st.write("⚠️ No geocoded data available for map")
-except Exception as e:
-    st.error(f"❌ Error creating map: {e}")
-
-st.write("✅ App completed successfully!")
