@@ -103,35 +103,5 @@ st.plotly_chart(fig2)
 # --------------------------
 df_map = df.dropna(subset=['lat','lon'])
 if not df_map.empty:
-    st.subheader("Payments Map")
-    fig_map = px.scatter_mapbox(
-        df_map, lat="lat", lon="lon", hover_name="supplier", hover_data=["amount_gbp","description"],
-        color="amount_gbp", size="amount_gbp", zoom=8, mapbox_style="open-street-map"
-    )
-    st.plotly_chart(fig_map)
-
-# --------------------------
-# Anomaly detection with filters
-# --------------------------
-st.subheader("Anomalies / Alerts")
-
-# User filter selection
-anomaly_options = [
-    "Large payments (>£100k)",
-    "Frequent payments (>5 per month)",
-    "Duplicate invoice numbers",
-    "Payments without invoices",
-    "Single supplier dominance"
-]
-selected_anomalies = st.multiselect("Select anomaly types to display", anomaly_options, default=anomaly_options)
-
-conn = sqlite3.connect(DB_NAME)
-c = conn.cursor()
-
-# Large payments
-if "Large payments (>£100k)" in selected_anomalies:
-    c.execute("SELECT id, council, supplier, amount_gbp, payment_date FROM payments WHERE amount_gbp > 100000")
-    large_df = pd.DataFrame(c.fetchall(), columns=["id","council","supplier","amount_gbp","payment_date"])
-    if not large_df.empty:
-        st.markdown("**Large payments (>£100k
+   
 
