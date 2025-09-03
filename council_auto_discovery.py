@@ -1,7 +1,17 @@
 import requests
 import pandas as pd
 from io import BytesIO
-from council_fetchers import FETCHERS
+import sys
+import os
+
+# Add the current directory to Python path to find council_fetchers
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from council_fetchers import FETCHERS
+except ImportError:
+    # Fallback if council_fetchers can't be imported
+    FETCHERS = {}
 
 def fetch_new_council_csv(url, council_name):
     if council_name in FETCHERS:
