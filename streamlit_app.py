@@ -8,8 +8,6 @@ from pattern_detection import detect_anomalies
 from council_auto_discovery import discover_new_councils, fetch_new_council_csv
 from geocode import geocode_address
 import plotly.express as px
-
-# --- NEW: For council fetchers ---
 from council_fetchers import FETCHERS
 
 DB_NAME = "spend.db"
@@ -27,11 +25,6 @@ for council_name, fetch_func in FETCHERS.items():
     try:
         records = fetch_func()
         if records:
-            # Optionally apply geocoding here, e.g.
-            # for r in records:
-            #     if 'lat' not in r or 'lon' not in r:
-            #         lat, lon = geocode_address(r.get("supplier"))
-            #         r["lat"], r["lon"] = lat, lon
             all_fetched_records.extend(records)
             st.info(f"Fetched {len(records)} records from {council_name}")
     except Exception as e:
@@ -140,43 +133,5 @@ if "Large payments (>£100k)" in selected_anomalies:
     c.execute("SELECT id, council, supplier, amount_gbp, payment_date FROM payments WHERE amount_gbp > 100000")
     large_df = pd.DataFrame(c.fetchall(), columns=["id","council","supplier","amount_gbp","payment_date"])
     if not large_df.empty:
-        st.markdown("**Large payments (>£100k):**")
-        st.dataframe(large_df[large_df['council']==selected_council])
-
-# Frequent payments
-if "Frequent payments (>5 per month)" in selected_anomalies:
-    c.execute('''
-        SELECT id, council, supplier, COUNT(*) as count, SUM(amount_gbp) as total_amount
-        FROM payments
-        GROUP BY council, supplier, strftime('%Y-%m', payment_date)
-        HAVING count > 5
-    ''')
-    frequent_df = pd.DataFrame(c.fetchall(), columns=["id","council","supplier","count","total_amount"])
-    if not frequent_df.empty:
-        st.markdown("**Frequent payments (>5 per month):**")
-        st.dataframe(frequent_df[frequent_df['council']==selected_council])
-
-# Duplicate invoice numbers
-if "Duplicate invoice numbers" in selected_anomalies:
-    c.execute('''
-        SELECT invoice_ref, COUNT(*) as cnt, SUM(amount_gbp) as total_amount
-        FROM payments
-        WHERE invoice_ref != ''
-        GROUP BY invoice_ref
-        HAVING cnt > 1
-    ''')
-    dup_df = pd.DataFrame(c.fetchall(), columns=["invoice_ref","count","total_amount"])
-    if not dup_df.empty:
-        st.markdown("**Duplicate invoice numbers:**")
-        st.dataframe(dup_df)
-
-# Payments without invoices
-if "Payments without invoices" in selected_anomalies:
-    c.execute("SELECT * FROM payments WHERE invoice_ref IS NULL OR invoice_ref = ''")
-    missing_inv_df = pd.DataFrame(c.fetchall(), columns=["id","council","payment_date","supplier","description","category","amount_gbp","invoice_ref","lat","lon","hash"])
-    if not missing_inv_df.empty:
-        st.markdown("**Payments without invoices:**")
-        st.dataframe(missing_inv_df[missing_inv_df['council']==selected_council])
-
-# Single supplier dominance
+        st.markdown("**Large payments (>£100k
 
