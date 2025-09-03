@@ -1,38 +1,56 @@
 import re
 from datetime import datetime
+import pandas as pd
 
 def clean_supplier(supplier):
-    if not supplier:
+    if supplier is None:
         return ""
-    return supplier.strip().title()
+    s = str(supplier).strip()
+    s = re.sub(r"\s+", " ", s)
+    return s.title()
 
 def clean_amount(amount):
+    if amount is None:
+        return 0.0
     try:
-        return float(str(amount).replace(',', '').replace('£',''))
-    except:
+        s = str(amount).replace("£", "").replace(",", "").strip()
+        return float(s) if s else 0.0
+    except Exception:
         return 0.0
 
+# Returns YYYY-MM-DD or "" if unparseable
 def clean_date(date_str):
+    if date_str is None or str(date_str).strip() == "":
+        return ""
+    if isinstance(date_str, datetime):
+        return date_str.strftime("%Y-%m-%d")
+    s = str(date_str).strip()
+    # Robust parse (UK-first)
     try:
-        return datetime.strptime(date_str, '%Y-%m-%d').date().isoformat()
-    except:
-        try:
-            return datetime.strptime(date_str, '%d/%m/%Y').date().isoformat()
-        except:
-            return date_str
+        dt = pd.to_datetime(s, dayfirst=True, errors="raise")
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y", "%d %b %Y", "%d %B %Y"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                return dt.strftime("%Y-%m-%d")
+            except Exception:
+                continue
+    return ""
 
 def clean_description(desc):
-    if not desc:
+    if desc is None:
         return ""
-    return re.sub(r'\s+', ' ', desc.strip())
+    s = re.sub(r"\s+", " ", str(desc)).strip()
+    return s[:2000]  # tame very long cells
 
 def normalize_record(record):
     return {
-        "council": record.get("council", "").strip(),
+        "council": str(record.get("council", "")).strip(),
         "payment_date": clean_date(record.get("payment_date")),
         "supplier": clean_supplier(record.get("supplier")),
         "description": clean_description(record.get("description")),
-        "category": record.get("category", "").strip(),
+        "category": str(record.get("category", "")).strip(),
         "amount_gbp": clean_amount(record.get("amount_gbp")),
-        "invoice_ref": record.get("invoice_ref", "").strip()
+        "invoice_ref": str(record.get("invoice_ref", "")).strip(),
     }
