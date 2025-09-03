@@ -26,10 +26,16 @@ jobs:
         run: |
           python fetch_and_ingest.py
           
-      - name: Commit updated DB (if any)
+      - name: Check for changes and commit
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add spend.db
-          git commit -m "Monthly data update" || echo "No changes to commit"
-          git push origin main
+          # Add all files except ignored ones
+          git add .
+          # Check if there are any staged changes
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Monthly data update"
+            git push origin main
+          fi
