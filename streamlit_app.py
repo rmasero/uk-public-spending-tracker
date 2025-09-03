@@ -35,53 +35,78 @@ fetcher_files = sorted(
 )
 predefined_councils = []
 
-# Dynamically import and get council_name & csv_url from each fetcher
-for idx, filepath in enumerate(fetcher_files):
+# Import council_name, csv_url, and fetch_payments if available from each fetcher
+for filepath in fetcher_files:
     try:
         spec = importlib.util.spec_from_file_location("fetcher", filepath)
         fetcher = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fetcher)
         council_name = getattr(fetcher, "council_name", None)
         csv_url = getattr(fetcher, "csv_url", None)
+        # Store also the fetch_payments function if it exists
+        fetch_payments_func = getattr(fetcher, "fetch_payments", None)
         if council_name and csv_url:
-            predefined_councils.append((council_name, csv_url))
-    except Exception:
+            predefined_councils.append(
+                {
+                    "council_name": council_name,
+                    "csv_url": csv_url,
+                    "fetcher_path": filepath,
+                    "fetch_payments_func": fetch_payments_func,
+                }
+            )
+    except Exception as e:
         # Don't show error, just skip
         pass
 
-# --------------------------
-# Helper for loading council data with timeout and one retry
-# --------------------------
+def try_fetch_predefined_council(council):
+    """Try to fetch payments using custom fetch_payments, else fallback to generic CSV loader."""
+    records = None
+    try:
+        if council["fetch_payments_func"]:
+            # Custom fetcher
+            records = council["fetch_payments_func"]()
+        else:
+            # Fallback to generic CSV loader
+            records = fetch_new_council_csv(council["csv_url"], council["council_name"])
+    except Exception:
+        records = None
+    return records
+
 def try_fetch_new_council_csv(csv_url, council_name, timeout=15):
     try:
         return fetch_new_council_csv(csv_url, council_name, timeout=timeout)
     except Exception:
         return None
 
-def load_council_data(councils, progress_start, progress_range, desc_prefix):
+def load_council_data(councils, progress_start, progress_range, desc_prefix, predefined=False):
     failed = []
     total = len(councils)
-    for i, (council_name, csv_url) in enumerate(councils):
+    for i, council in enumerate(councils):
         pct = progress_start + int(i * (progress_range / max(1, total)))
-        progress_bar.progress(pct, text=f"{desc_prefix} {council_name}...")
-        records = try_fetch_new_council_csv(csv_url, council_name)
+        progress_bar.progress(pct, text=f"{desc_prefix} {council['council_name'] if predefined else council[0]}...")
+        if predefined:
+            records = try_fetch_predefined_council(council)
+            name = council["council_name"]
+            url = council["csv_url"]
+        else:
+            name, url = council
+            records = try_fetch_new_council_csv(url, name)
         if records:
             insert_records(records)
         else:
-            failed.append((council_name, csv_url))
+            failed.append(council)
         time.sleep(0.05)
     return failed
 
-# Load predefined councils
-failed_predefined = load_council_data(predefined_councils, 2, 23, "Loading predefined council:")
+# Load predefined councils first (custom fetchers take precedence)
+failed_predefined = load_council_data(predefined_councils, 2, 23, "Loading predefined council:", predefined=True)
 
 # --------------------------
 # Discover and load new councils (round 1)
 # --------------------------
 progress_bar.progress(25, text="Discovering new councils...")
 all_new_councils = discover_new_councils()
-# Remove any already loaded councils
-predef_names = set(name for name, _ in predefined_councils)
+predef_names = set(c["council_name"] for c in predefined_councils)
 new_councils = [(name, url) for name, url in all_new_councils if name not in predef_names]
 failed_new = load_council_data(new_councils, 25, 15, "Loading new council:")
 
@@ -91,7 +116,14 @@ failed_new = load_council_data(new_councils, 25, 15, "Loading new council:")
 failed_all = failed_predefined + failed_new
 if failed_all:
     progress_bar.progress(40, text="Retrying failed council loads...")
-    failed_retry = load_council_data(failed_all, 40, 5, "Retrying council:")
+    if failed_predefined:
+        # Retry predefined with custom logic
+        failed_retry_predef = load_council_data(failed_predefined, 40, 3, "Retrying council:", predefined=True)
+    else:
+        failed_retry_predef = []
+    # Retry new councils
+    failed_retry_new = load_council_data(failed_new, 43, 2, "Retrying council:", predefined=False)
+    failed_retry = failed_retry_predef + failed_retry_new
 else:
     failed_retry = []
 
@@ -101,8 +133,7 @@ else:
 # --------------------------
 progress_bar.progress(45, text="Scanning for additional councils...")
 more_new_councils = discover_new_councils()
-# Filter out already loaded or attempted (predefined + new + failed)
-already_seen = set(name for name, _ in predefined_councils + new_councils + failed_all)
+already_seen = set(list(predef_names) + [name for name, _ in new_councils] + [c["council_name"] if isinstance(c, dict) else c[0] for c in failed_all])
 to_load = [(name, url) for name, url in more_new_councils if name not in already_seen]
 load_council_data(to_load, 45, 5, "Loading additional council:")
 
@@ -159,25 +190,27 @@ st.write(f"**Number of transactions:** {len(df)}")
 # Top suppliers
 # --------------------------
 progress_bar.progress(75, text="Calculating top suppliers...")
-top_suppliers = df.groupby("supplier")['amount_gbp'].sum().sort_values(ascending=False).head(10).reset_index()
-fig1 = px.bar(top_suppliers, x="supplier", y="amount_gbp", title="Top 10 Suppliers by Payment Amount")
-st.plotly_chart(fig1)
+if not df.empty:
+    top_suppliers = df.groupby("supplier")['amount_gbp'].sum().sort_values(ascending=False).head(10).reset_index()
+    fig1 = px.bar(top_suppliers, x="supplier", y="amount_gbp", title="Top 10 Suppliers by Payment Amount")
+    st.plotly_chart(fig1)
 
 # --------------------------
 # Payments over time
 # --------------------------
 progress_bar.progress(80, text="Processing payments over time...")
-df['payment_date'] = pd.to_datetime(df['payment_date'])
-payments_by_month = df.groupby(df['payment_date'].dt.to_period("M"))['amount_gbp'].sum().reset_index()
-payments_by_month['payment_date'] = payments_by_month['payment_date'].dt.to_timestamp()
-fig2 = px.line(payments_by_month, x="payment_date", y="amount_gbp", title="Payments Over Time")
-st.plotly_chart(fig2)
+if not df.empty:
+    df['payment_date'] = pd.to_datetime(df['payment_date'])
+    payments_by_month = df.groupby(df['payment_date'].dt.to_period("M"))['amount_gbp'].sum().reset_index()
+    payments_by_month['payment_date'] = payments_by_month['payment_date'].dt.to_timestamp()
+    fig2 = px.line(payments_by_month, x="payment_date", y="amount_gbp", title="Payments Over Time")
+    st.plotly_chart(fig2)
 
 # --------------------------
 # Map visualization
 # --------------------------
 progress_bar.progress(83, text="Preparing map visualization...")
-df_map = df.dropna(subset=['lat','lon'])
+df_map = df.dropna(subset=['lat','lon']) if not df.empty else pd.DataFrame()
 if not df_map.empty:
     st.subheader("Payments Map")
     fig_map = px.scatter_mapbox(
@@ -241,7 +274,10 @@ if "Duplicate invoice numbers" in selected_anomalies:
 # Payments without invoices
 if "Payments without invoices" in selected_anomalies:
     c.execute("SELECT * FROM payments WHERE invoice_ref IS NULL OR invoice_ref = ''")
-    missing_inv_df = pd.DataFrame(c.fetchall(), columns=["id","council","payment_date","supplier","description","category","amount_gbp","invoice_ref","lat","lon","hash"])
+    missing_inv_df = pd.DataFrame(
+        c.fetchall(),
+        columns=["id","council","payment_date","supplier","description","category","amount_gbp","invoice_ref","lat","lon","hash"]
+    )
     if not missing_inv_df.empty:
         st.markdown("**Payments without invoices:**")
         st.dataframe(missing_inv_df[missing_inv_df['council']==selected_council])
@@ -261,7 +297,7 @@ if "Single supplier dominance" in selected_anomalies:
         supplier, total_amount = row
         c.execute("SELECT SUM(amount_gbp) FROM payments WHERE council=?", (selected_council,))
         total_council = c.fetchone()[0]
-        if total_council > 0 and (total_amount/total_council) > 0.5:
+        if total_council and total_amount and total_council > 0 and (total_amount/total_council) > 0.5:
             st.markdown(f"**Warning:** Supplier `{supplier}` received more than 50% of total payments (£{total_amount:,.2f})")
 
 conn.close()
@@ -303,7 +339,8 @@ progress_bar.progress(98, text="Citizen feedback loaded.")
 # CSV download
 # --------------------------
 progress_bar.progress(100, text="All data loaded!")
-csv_data = df.to_csv(index=False).encode('utf-8')
-st.download_button(label="Download CSV", data=csv_data, file_name=f"{selected_council}_payments.csv", mime="text/csv")
+if not df.empty:
+    csv_data = df.to_csv(index=False).encode('utf-8')
+    st.download_button(label="Download CSV", data=csv_data, file_name=f"{selected_council}_payments.csv", mime="text/csv")
 
 progress_bar.empty()
