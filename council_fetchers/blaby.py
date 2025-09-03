@@ -2,15 +2,19 @@ import pandas as pd
 import requests
 from io import BytesIO
 
+# These two variables are used for auto-discovery by the main app.
+council_name = "Blaby"
+csv_url = "https://www.blaby.gov.uk/open-data/payments.csv"
+
 def fetch_payments():
-    url = "https://www.blaby.gov.uk/open-data/payments.csv"
+    url = csv_url
     r = requests.get(url)
     df = pd.read_csv(BytesIO(r.content))
     
     payments = []
     for _, row in df.iterrows():
         payments.append({
-            "council": "Blaby",
+            "council": council_name,
             "payment_date": row.get("Date"),
             "supplier": row.get("Supplier"),
             "description": row.get("Purpose"),
