@@ -43,21 +43,13 @@ def _load_predefined_councils() -> List[Tuple[str, str, callable]]:
         items.append((name, csv_url, fetch_fn))
     return items
 
-with st.spinner("Setting up database…"):
-    create_tables()
-
-st.sidebar.header("Data controls")
-refresh = st.sidebar.button("Refresh all data (free sources)", type="primary")
-geocode_toggle = st.sidebar.checkbox("Geocode suppliers on import (slow; free Nominatim)", value=False)
-
-if refresh:
-    progress = st.sidebar.progress(0, text="Refreshing data…")
+def _refresh_all_data(do_geocode: bool = False) -> Tuple[int, int]:
+    """Refresh data from all councils. Returns (inserted, skipped)."""
     inserted_total = skipped_total = 0
 
-    # 1) Predefined councils (custom fetchers)
+    # 1) Predefined councils
     items = _load_predefined_councils()
-    for i, (name, csv_url, fetch_fn) in enumerate(items, start=1):
-        progress.progress(int(10 + (i / max(1, len(items))) * 40), text=f"Fetching: {name}")
+    for (name, csv_url, fetch_fn) in items:
         try:
             if callable(fetch_fn):
                 records = fetch_fn()
@@ -65,38 +57,55 @@ if refresh:
                 records = fetch_new_council_csv(csv_url, name)
             else:
                 records = []
-            ins, skip = insert_records(records, do_geocode=geocode_toggle)
+            ins, skip = insert_records(records, do_geocode=do_geocode)
             inserted_total += ins
             skipped_total += skip
         except Exception as e:
             st.warning(f"Failed to import {name}: {e}")
 
-    # 2) Discover more councils via data.gov.uk
+    # 2) Discover more councils
     try:
         discovered = discover_new_councils()
     except Exception as e:
         discovered = []
         st.info(f"Discovery skipped: {e}")
 
-    for j, (name, url) in enumerate(discovered, start=1):
-        progress.progress(int(55 + (j / max(1, len(discovered))) * 35), text=f"Importing discovered: {name}")
+    for (name, url) in discovered:
         try:
             records = fetch_new_council_csv(url, name)
-            # Keep discovery fast; geocoding can be re-run later
+            # keep discovery fast: no geocoding unless button pressed
             ins, skip = insert_records(records, do_geocode=False)
             inserted_total += ins
             skipped_total += skip
         except Exception:
             continue
 
-    progress.progress(96, text="Finalizing…")
-    st.success(f"Refresh complete. Inserted {inserted_total:,} new rows; skipped {skipped_total:,} (dupes/unparseable).")
+    return inserted_total, skipped_total
 
-# Filters
+with st.spinner("Setting up database…"):
+    create_tables()
+
+# --- Automatic refresh on start (without geocode) ---
+if "auto_refreshed" not in st.session_state:
+    st.session_state["auto_refreshed"] = True
+    with st.spinner("Auto-refreshing data (without geocoding)…"):
+        ins, skip = _refresh_all_data(do_geocode=False)
+    st.success(f"Auto-refresh complete. Inserted {ins:,} new rows; skipped {skip:,} (dupes/unparseable).")
+
+# --- Sidebar controls ---
+st.sidebar.header("Data controls")
+st.sidebar.markdown("⚠️ Refresh with **geocoding** will be **slow** because free Nominatim limits lookups.")
+
+if st.sidebar.button("Refresh all data **with geocoding**", type="primary"):
+    with st.spinner("Refreshing with geocoding (may take a while)…"):
+        ins, skip = _refresh_all_data(do_geocode=True)
+    st.success(f"Refresh with geocoding complete. Inserted {ins:,} rows; skipped {skip:,}.")
+
+# --- Filters ---
 st.sidebar.subheader("Filters")
 councils = _get_councils()
 if not councils:
-    st.info("No data yet. Click **Refresh all data** to import from free council CSVs.")
+    st.info("No data available. Try refreshing data.")
     st.stop()
 
 sel_council = st.sidebar.selectbox("Council", councils, index=0)
@@ -116,7 +125,7 @@ if supplier_query.strip():
 
 df = _query_df(sql, tuple(params))
 
-# KPIs
+# --- KPIs ---
 cols = st.columns(3)
 with cols[0]:
     st.metric("Total paid", f"£{df['amount_gbp'].sum():,.2f}")
@@ -129,7 +138,7 @@ with cols[2]:
     else:
         st.metric("Date range", "—")
 
-# Charts
+# --- Charts ---
 if df.empty:
     st.warning("No rows match your filters.")
 else:
@@ -152,7 +161,7 @@ else:
         )
         st.plotly_chart(px.line(df_time, x="payment_month", y="amount_gbp", title="Payments over time"), use_container_width=True)
 
-    # Map if lat/lon available
+    # Map
     if {"lat", "lon"}.issubset(df.columns) and df[["lat", "lon"]].notna().any().any():
         figm = px.scatter_mapbox(
             df.dropna(subset=["lat", "lon"]),
@@ -167,7 +176,7 @@ else:
         figm.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=40, b=0), title="Geocoded payments")
         st.plotly_chart(figm, use_container_width=True)
 
-# Anomalies / Alerts
+# --- Anomalies / Alerts ---
 with st.expander("Anomalies / Alerts", expanded=False):
     a1 = _query_df("""
         SELECT id, council, supplier, amount_gbp, payment_date
@@ -226,7 +235,7 @@ with st.expander("Anomalies / Alerts", expanded=False):
     if not dom.empty and float(dom["pct"].iloc[0]) > 50.0:
         st.error(f"Supplier dominance: {dom['supplier'].iloc[0]} accounts for {dom['pct'].iloc[0]:.1f}% of spend (£{dom['total'].iloc[0]:,.0f}).")
 
-# Feedback form
+# --- Feedback form ---
 st.header("Citizen feedback")
 with st.form("feedback"):
     pid = st.number_input("Payment ID", min_value=1, step=1)
@@ -255,7 +264,7 @@ if not fb.empty:
     st.subheader("Recent feedback")
     st.dataframe(fb, use_container_width=True)
 
-# CSV export
+# --- CSV export ---
 if not df.empty:
     st.download_button(
         "Download filtered CSV",
