@@ -30,7 +30,7 @@ def discover_new_councils(rows_per_page=1000, max_pages=10):
     discovered = []
     seen_urls = set()
 
-    st.info("🔍 Starting council discovery from data.gov.uk…")
+    st.info("Starting council discovery from data.gov.uk…")
 
     for page in range(max_pages):
         start = page * rows_per_page
@@ -44,20 +44,20 @@ def discover_new_councils(rows_per_page=1000, max_pages=10):
             resp = requests.get(API_BASE, params=params, timeout=15)
             resp.raise_for_status()
         except Exception as e:
-            st.warning(f"⚠️ Failed to fetch page {page+1}: {e}")
+            st.warning(f"Failed to fetch page {page+1}: {e}")
             continue
 
         data = resp.json()
         results = data.get("result", {}).get("results", [])
         if not results:
-            st.write(f"✅ No more datasets found after {page} pages.")
+            st.write(f"No more datasets found after {page} pages.")
             break
 
-        st.write(f"📦 Page {page+1}: {len(results)} datasets fetched")
+        st.write(f"Page {page+1}: {len(results)} datasets fetched")
 
         for pkg in results:
             org = pkg.get("organization", {})
-            council_name = org.get("title") or pkg.get("organization", {}).get("name")
+            council_name = org.get("title") or org.get("name")
             if not council_name:
                 continue
 
@@ -71,7 +71,16 @@ def discover_new_councils(rows_per_page=1000, max_pages=10):
         # Stop if we’ve exhausted total results
         total = data.get("result", {}).get("count", 0)
         if start + rows_per_page >= total:
-            st.write("✅ All available datasets scanned.")
+            st.write("All available datasets scanned.")
             break
 
-    st.success(f"🎉 Discovery compl
+    st.success(f"Discovery complete: {len(discovered)} council CSVs found")
+    return discovered
+
+
+if __name__ == "__main__":
+    # For debugging outside Streamlit
+    councils = discover_new_councils()
+    print(f"Discovered {len(councils)} councils")
+    for c, u in councils[:10]:
+        print(c, "->", u)
