@@ -1,41 +1,38 @@
 import time
+from typing import List, Tuple, Dict, Any
 from io import BytesIO
-from typing import List, Tuple
 
 import pandas as pd
 import requests
 
-from council_fetchers import FETCHERS
-from councils_catalog import build_catalog, load_catalog
-
-def fetch_new_council_csv(url: str, council_name: str, timeout: int = 10) -> list:
+# --- Generic CSV normalization for councils without custom fetchers ---
+def fetch_new_council_csv(url: str, council_name: str, timeout: int = 8) -> list:
     """
-    Generic CSV fetcher for councils without a custom parser.
-    Returns a list of dicts with normalized keys.
+    Fetch a CSV and map common columns into our schema.
     """
-    # Respect custom fetchers if available
-    if council_name in FETCHERS and callable(FETCHERS[council_name]):
-        return FETCHERS[council_name]()
-
     r = requests.get(url, timeout=timeout)
     r.raise_for_status()
-    content = r.content
+
+    # Try UTF-8 first, then fall back
     try:
-        df = pd.read_csv(BytesIO(content))
+        df = pd.read_csv(BytesIO(r.content))
     except UnicodeDecodeError:
-        df = pd.read_csv(BytesIO(content), encoding="ISO-8859-1")
+        df = pd.read_csv(BytesIO(r.content), encoding="ISO-8859-1")
+    except Exception:
+        # Some councils publish semicolon-delimited
+        df = pd.read_csv(BytesIO(r.content), sep=";")
 
     # Flexible column mapping
     colmap = {
-        "payment_date": ["payment_date", "date", "Payment Date", "Date"],
-        "supplier": ["supplier", "Supplier", "Supplier Name", "supplier_name"],
-        "description": ["description", "Description", "purpose", "Purpose"],
-        "category": ["category", "Department", "Service Area", "Cost Centre", "ServiceArea"],
-        "amount_gbp": ["amount", "Amount", "Amount Paid", "AmountPaid", "Net Amount", "Gross Amount"],
+        "payment_date": ["payment_date", "date", "Payment Date", "Date", "PaymentDate"],
+        "supplier": ["supplier", "Supplier", "Supplier Name", "supplier_name", "SupplierName"],
+        "description": ["description", "Description", "purpose", "Purpose", "Details"],
+        "category": ["category", "Department", "Service Area", "Cost Centre", "ServiceArea", "Directorate"],
+        "amount_gbp": ["amount", "Amount", "Amount Paid", "AmountPaid", "Net Amount", "NetAmount", "Gross Amount", "Value"],
         "invoice_ref": ["invoice", "Invoice", "Invoice Ref", "InvoiceRef", "invoice_number", "Invoice Number"],
     }
-
     cols_lower = {c.lower(): c for c in df.columns}
+
     def pick(options):
         for o in options:
             if o.lower() in cols_lower:
@@ -62,17 +59,61 @@ def fetch_new_council_csv(url: str, council_name: str, timeout: int = 10) -> lis
         })
     return payments
 
-def discover_new_councils() -> List[Tuple[str, str]]:
-    """
-    Return [(council_name, csv_url)] for all councils discovered via the cached or freshly-built catalog.
-    """
-    catalog = load_catalog()
-    if not catalog:
-        # Build with pagination (free CKAN API)
-        catalog = build_catalog()
+# --- Discovery via data.gov.uk CKAN API (no caching) ---
+CKAN_SEARCH = "https://data.gov.uk/api/3/action/package_search"
+QUERY_TERMS = [
+    '"payments to suppliers"',
+    '"expenditure over 500"',
+    '"spend over 500"',
+    '"supplier payments"',
+    '"payments over 250"',
+    '"payments over 500"',
+]
+Q = " OR ".join(QUERY_TERMS)
 
+def _page(q: str, rows: int, start: int, timeout: int = 20) -> Dict[str, Any]:
+    r = requests.get(CKAN_SEARCH, params={"q": q, "rows": rows, "start": start}, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def discover_new_councils(max_pages: int = 20, rows_per_page: int = 1000, sleep_between: float = 0.25) -> List[Tuple[str, str]]:
+    """
+    Returns (council_name, csv_url) pairs for all CSV resources that look like
+    local authority spending datasets.
+    """
     pairs: List[Tuple[str, str]] = []
-    for council, payload in catalog.items():
-        for url in payload.get("csv_urls", []):
-            pairs.append((council, url))
-    return pairs
+    start = 0
+    total = None
+
+    for _ in range(max_pages):
+        data = _page(Q, rows_per_page, start)
+        result = data.get("result", {})
+        if total is None:
+            total = int(result.get("count", 0))
+        packages = result.get("results", []) or []
+        if not packages:
+            break
+
+        for pkg in packages:
+            org = pkg.get("organization") or {}
+            council = (org.get("title") or org.get("name") or "").strip() or (pkg.get("title") or "").strip()
+            for res in pkg.get("resources", []) or []:
+                fmt = str(res.get("format", "")).lower()
+                url = res.get("url") or res.get("download_url")
+                if fmt == "csv" and url:
+                    pairs.append((council, url))
+
+        start += rows_per_page
+        if total is not None and start >= total:
+            break
+        time.sleep(sleep_between)
+
+    # de-duplicate while preserving order
+    seen = set()
+    out = []
+    for name, url in pairs:
+        key = (name, url)
+        if key not in seen:
+            seen.add(key)
+            out.append((name, url))
+    return out
