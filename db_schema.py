@@ -10,42 +10,40 @@ def create_tables():
     c.execute("""
     CREATE TABLE IF NOT EXISTS payments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        council TEXT NOT NULL,
-        payment_date TEXT NOT NULL, -- ISO YYYY-MM-DD
+        council TEXT,
+        payment_date TEXT,
         supplier TEXT,
         description TEXT,
         category TEXT,
-        amount_gbp REAL NOT NULL DEFAULT 0,
+        amount_gbp REAL,
         invoice_ref TEXT,
         lat REAL,
         lon REAL,
-        hash TEXT NOT NULL
-    );
+        hash TEXT UNIQUE
+    )
     """)
 
-    # Useful indexes
-    c.execute("CREATE INDEX IF NOT EXISTS idx_payments_council ON payments(council);")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(payment_date);")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_payments_supplier ON payments(supplier);")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_payments_invoice ON payments(invoice_ref);")
-    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_hash ON payments(hash);")
+    # Helpful indexes
+    c.execute("CREATE INDEX IF NOT EXISTS idx_payments_council ON payments(council)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(payment_date)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_payments_supplier ON payments(supplier)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_payments_hash ON payments(hash)")
 
     # Feedback table
     c.execute("""
     CREATE TABLE IF NOT EXISTS feedback (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        payment_id INTEGER NOT NULL,
+        payment_id INTEGER,
         user_name TEXT,
         comment TEXT,
-        rating INTEGER CHECK (rating BETWEEN 1 AND 5),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(payment_id) REFERENCES payments(id)
-    );
+        rating INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
     """)
 
     conn.commit()
     conn.close()
-    print(f"{DB_NAME} ready with payments + feedback tables.")
 
 if __name__ == "__main__":
     create_tables()
+    print(f"{DB_NAME} ready.")
