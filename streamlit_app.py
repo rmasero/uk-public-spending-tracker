@@ -162,7 +162,6 @@ def preflight_url(url: str, timeout_secs=3.0) -> dict:
             info["content_type"] = r.headers.get("Content-Type")
             info["content_length"] = r.headers.get("Content-Length")
             info["resolved_url"] = r.url
-            # Some servers don't support HEAD; fall back if weird
             if r.status_code >= 400 or (info["content_type"] is None and info["content_length"] is None):
                 raise Exception("HEAD not informative, trying GET")
         except Exception:
@@ -175,7 +174,6 @@ def preflight_url(url: str, timeout_secs=3.0) -> dict:
                 snippet = r.raw.read(2048, decode_content=True)
             except Exception:
                 snippet = r.content[:2048]
-            # Safely decode snippet
             try:
                 info["snippet"] = snippet.decode("utf-8", errors="replace")
             except Exception:
@@ -187,9 +185,6 @@ def preflight_url(url: str, timeout_secs=3.0) -> dict:
 
 
 def fetch_records_with_timeout(url: str, council_name: str, timeout_secs: float = 3.0):
-    """
-    Wrap council_auto_discovery.fetch_new_council_csv with a wall-clock timeout.
-    """
     with ThreadPoolExecutor(max_workers=1) as ex:
         fut = ex.submit(fetch_new_council_csv, url, council_name)
         return fut.result(timeout=timeout_secs)
@@ -199,13 +194,6 @@ def fetch_records_with_timeout(url: str, council_name: str, timeout_secs: float 
 # Orchestration
 # =========================
 def discover_and_ingest(geocode_enabled: bool, debug_mode: bool, limit: int | None):
-    """
-    1) Discover councils + CSV URLs
-    2) Fetch each council with a 3s timeout (skip slow), capture diagnostics on failure
-    3) Retry once for timeouts after first pass
-    4) Insert using insert_records (geocoding optional)
-    Returns: (successes, failures, timeouts, errors_list)
-    """
     errors = []
 
     with st.status("Starting discovery…", state="running") as status:
@@ -227,7 +215,6 @@ def discover_and_ingest(geocode_enabled: bool, debug_mode: bool, limit: int | No
         successes = failures = timeouts = 0
         retry_queue = []
 
-        # Pass 1
         for idx, (council_name, url) in enumerate(discovered, start=1):
             is_custom = council_name in FETCHERS
             progress.progress(min(idx / max(total, 1), 1.0),
@@ -254,18 +241,15 @@ def discover_and_ingest(geocode_enabled: bool, debug_mode: bool, limit: int | No
                     is_custom_fetcher=is_custom, error_type=type(e).__name__,
                     error_message=str(e), traceback=traceback.format_exc(),
                 )
-                # Try to capture HTTP info for non-custom path
                 if not is_custom:
                     info = preflight_url(url, timeout_secs=3.0)
                     err.update(info)
                 errors.append(err)
 
-            # keep UI responsive
             elapsed = time.time() - start
             if elapsed < 0.02:
                 time.sleep(0.01)
 
-        # Retry timeouts once
         if retry_queue:
             status.update(label=f"Retrying {len(retry_queue)} timed-out councils once…")
             for idx, (council_name, url) in enumerate(retry_queue, start=1):
@@ -310,11 +294,9 @@ with st.sidebar:
     limit = st.number_input("Debug: limit councils (0 = all)", min_value=0, max_value=5000, value=0, step=50)
     preview_rows = st.number_input("Preview rows to show", 50, 2000, 200, step=50)
 
-# Prepare DB
 with st.spinner("Setting up database…"):
     ensure_db()
 
-# Auto-run on first load (no geocoding)
 if run_once_per_session("__bootstrapped__"):
     st.info("Auto-loading councils & payments (geocoding OFF for speed)…")
     succ, fail, tout, errs = discover_and_ingest(
@@ -327,7 +309,6 @@ if run_once_per_session("__bootstrapped__"):
 else:
     st.caption("Session active. Use the update button to refresh.")
 
-# Update button (WITH geocoding, slow)
 if st.button("🔄 Update & Geocode (slow)"):
     st.warning("This may be **slow** due to geocoding. Keep this tab open; progress is shown below.")
     succ, fail, tout, errs = discover_and_ingest(
@@ -349,7 +330,6 @@ errors = st.session_state.get("last_errors", [])
 if not errors:
     st.caption("No failures recorded in this session.")
 else:
-    # Compact summary table
     df_err = pd.DataFrame([{
         "timestamp": e.get("timestamp"),
         "council": e.get("council"),
@@ -376,12 +356,21 @@ else:
                 st.caption(f"Len: {e.get('content_length') or '—'}")
             st.code(f"{e.get('error_type')}: {e.get('error_message')}")
             if e.get("snippet"):
-                st.text_area("Response snippet", value=e["snippet"], height=120)
+                st.text_area(
+                    "Response snippet",
+                    value=e["snippet"],
+                    height=120,
+                    key=f"snippet_{i}"   # ✅ unique key
+                )
             if e.get("traceback"):
-                st.text_area("Traceback", value=e["traceback"], height=160)
+                st.text_area(
+                    "Traceback",
+                    value=e["traceback"],
+                    height=160,
+                    key=f"traceback_{i}"  # ✅ unique key
+                )
             st.markdown("---")
 
-    # Save + download buttons
     json_path, csv_path = save_error_report(errors)
     if json_path and csv_path:
         with open(json_path, "rb") as f:
