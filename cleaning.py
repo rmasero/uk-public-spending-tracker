@@ -1,56 +1,63 @@
-import re
 from datetime import datetime
-import pandas as pd
+from typing import Any, Dict, Optional
 
-def clean_supplier(supplier):
-    if supplier is None:
+def clean_supplier(s: Any) -> str:
+    if s is None:
         return ""
-    s = str(supplier).strip()
-    s = re.sub(r"\s+", " ", s)
-    return s.title()
+    return str(s).strip()
 
-def clean_amount(amount):
-    if amount is None:
-        return 0.0
+def clean_amount(a: Any) -> float:
     try:
-        s = str(amount).replace("£", "").replace(",", "").strip()
-        return float(s) if s else 0.0
+        s = str(a).replace(",", "").replace("£", "").strip()
+        if s == "":
+            return 0.0
+        return float(s)
     except Exception:
         return 0.0
 
-# Returns YYYY-MM-DD or "" if unparseable
-def clean_date(date_str):
-    if date_str is None or str(date_str).strip() == "":
-        return ""
-    if isinstance(date_str, datetime):
-        return date_str.strftime("%Y-%m-%d")
-    s = str(date_str).strip()
-    # Robust parse (UK-first)
+def _parse_date(ds: str) -> Optional[str]:
+    # Try common formats
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y", "%d %b %Y", "%Y-%m"):
+        try:
+            dt = datetime.strptime(ds.strip(), fmt)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    # Fallback: try month-only/unknown → keep as-is string if it looks like a year-month
     try:
-        dt = pd.to_datetime(s, dayfirst=True, errors="raise")
-        return dt.strftime("%Y-%m-%d")
+        # Very loose attempt: if it parses as year only
+        if len(ds.strip()) == 4 and ds.strip().isdigit():
+            return f"{ds.strip()}-01-01"
     except Exception:
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y", "%d %b %Y", "%d %B %Y"):
-            try:
-                dt = datetime.strptime(s, fmt)
-                return dt.strftime("%Y-%m-%d")
-            except Exception:
-                continue
-    return ""
+        pass
+    return None
 
-def clean_description(desc):
-    if desc is None:
-        return ""
-    s = re.sub(r"\s+", " ", str(desc)).strip()
-    return s[:2000]  # tame very long cells
+def clean_date(d: Any) -> Optional[str]:
+    if d is None:
+        return None
+    if isinstance(d, datetime):
+        return d.strftime("%Y-%m-%d")
+    ds = str(d).strip()
+    if ds == "":
+        return None
+    # Excel-like integer serialized? (very rough)
+    try:
+        n = float(ds)
+        # guard unlikely extremes
+        if 35000 < n < 60000:
+            base = datetime(1899, 12, 30)
+            return (base).strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return _parse_date(ds)
 
-def normalize_record(record):
+def normalize_record(r: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "council": str(record.get("council", "")).strip(),
-        "payment_date": clean_date(record.get("payment_date")),
-        "supplier": clean_supplier(record.get("supplier")),
-        "description": clean_description(record.get("description")),
-        "category": str(record.get("category", "")).strip(),
-        "amount_gbp": clean_amount(record.get("amount_gbp")),
-        "invoice_ref": str(record.get("invoice_ref", "")).strip(),
+        "council": (r.get("council") or "").strip(),
+        "payment_date": clean_date(r.get("payment_date")),
+        "supplier": clean_supplier(r.get("supplier")),
+        "description": (r.get("description") or "").strip(),
+        "category": (r.get("category") or "").strip(),
+        "amount_gbp": clean_amount(r.get("amount_gbp")),
+        "invoice_ref": (r.get("invoice_ref") or "").strip(),
     }
