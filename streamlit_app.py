@@ -1,11 +1,9 @@
-# streamlit_app.py (debug version)
+# streamlit_app.py (fixed + debug logging)
 
-import io
 import os
 import time
 import sqlite3
 import traceback
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
 import pandas as pd
@@ -14,20 +12,20 @@ import streamlit as st
 import fetch_and_ingest as ingest
 from fetch_and_ingest import insert_records
 from db_schema import create_tables
-from pattern_detection import detect_anomalies
 from council_auto_discovery import discover_new_councils, fetch_new_council_csv
 
 DB_NAME = "spend.db"
 
 
 def run_once_per_session(key: str) -> bool:
+    """Ensures code runs only once per Streamlit session."""
     if key not in st.session_state:
         st.session_state[key] = True
         return True
     return False
 
 
-def fetch_records_with_timeout(url: str, council_name: str, timeout_secs: float = 3.0):
+def fetch_records_with_timeout(council_name: str, url: str, timeout_secs: float = 3.0):
     """Fetch records with timeout (returns list of dicts)."""
     with ThreadPoolExecutor(max_workers=1) as ex:
         fut = ex.submit(fetch_new_council_csv, url, council_name)
@@ -47,6 +45,7 @@ def safe_insert(records, geocode_enabled: bool):
 
 
 def ensure_db():
+    """Ensure database and tables exist."""
     create_tables()
     if not os.path.exists(DB_NAME):
         open(DB_NAME, "a").close()
@@ -75,7 +74,8 @@ def discover_and_ingest(geocode_enabled: bool):
 
             try:
                 start = time.time()
-                records = fetch_records_with_timeout(url, council_name, timeout_secs=3.0)
+                # ✅ Fixed argument order
+                records = fetch_records_with_timeout(council_name, url, timeout_secs=3.0)
 
                 safe_insert(records, geocode_enabled=geocode_enabled)
                 successes += 1
@@ -113,6 +113,7 @@ def discover_and_ingest(geocode_enabled: bool):
 
 
 def list_councils_in_db():
+    """Return all councils currently in DB."""
     conn = sqlite3.connect(DB_NAME)
     try:
         c = conn.cursor()
@@ -123,6 +124,7 @@ def list_councils_in_db():
 
 
 def load_existing_dataframe(selected_council=None):
+    """Load payments from DB (filtered by council if provided)."""
     query = "SELECT council, payment_date, supplier, description, category, amount_gbp, invoice_ref, lat, lon FROM payments"
     params = []
     if selected_council and selected_council != "All":
