@@ -13,6 +13,7 @@ import streamlit as st
 from db_schema import create_tables, DB_NAME
 from fetch_and_ingest import insert_records
 from council_auto_discovery import discover_new_councils, fetch_new_council_csv
+from pattern_detection import detect_anomalies
 
 st.set_page_config(page_title="UK Public Spending Tracker", layout="wide")
 st.title("UK Public Spending Tracker")
@@ -32,10 +33,12 @@ def _get_councils() -> List[str]:
     return df["council"].tolist()
 
 # -------------------
-# Fetcher loader
+# Fetcher loader (optional custom council parsers)
 # -------------------
 def _load_predefined_councils() -> List[Tuple[str, str, Callable]]:
     fetcher_dir = "council_fetchers"
+    if not os.path.isdir(fetcher_dir):
+        return []
     files = sorted([f for f in glob.glob(os.path.join(fetcher_dir, "*.py")) if not f.endswith("__init__.py")])
     items = []
     for path in files:
@@ -49,76 +52,90 @@ def _load_predefined_councils() -> List[Tuple[str, str, Callable]]:
     return items
 
 # -------------------
-# Refresh logic
+# Refresh logic with progress + 3s timeout + one retry
 # -------------------
+def _call_with_timeout(fn: Callable, timeout_s: float = 3.0):
+    start = time.time()
+    try:
+        out = fn()
+    except Exception:
+        return None, False, 0.0
+    elapsed = time.time() - start
+    if elapsed > timeout_s:
+        return None, True, elapsed
+    return out, False, elapsed
+
 def refresh_all_data(do_geocode: bool = False, progress=None):
     inserted_total = skipped_total = 0
     failed = []
 
-    # 1) Predefined councils
+    # 1) Predefined councils first
     items = _load_predefined_councils()
+    n = len(items)
     for i, (name, csv_url, fetch_fn) in enumerate(items, start=1):
-        pct = int(5 + (i / max(1, len(items))) * 40)
+        pct = int(5 + (i / max(1, n)) * 35)
         if progress:
-            progress.progress(pct, text=f"Fetching: {name}")
+            progress.progress(pct, text=f"[{i}/{n}] Fetching (custom): {name}")
         try:
-            start = time.time()
             if callable(fetch_fn):
-                records = fetch_fn()
+                records, timed_out, elapsed = _call_with_timeout(fetch_fn, timeout_s=3.0)
             elif csv_url:
-                records = fetch_new_council_csv(csv_url, name)
+                records, timed_out, elapsed = _call_with_timeout(lambda: fetch_new_council_csv(csv_url, name, timeout=3), timeout_s=3.0)
             else:
-                records = []
-            elapsed = time.time() - start
-            if elapsed > 3.0:
+                records, timed_out, elapsed = ([], False, 0.0)
+
+            if records is None or timed_out:
                 failed.append((name, csv_url, fetch_fn))
                 continue
+
             ins, skip = insert_records(records, do_geocode=do_geocode)
             inserted_total += ins
             skipped_total += skip
         except Exception:
             failed.append((name, csv_url, fetch_fn))
 
-    # 2) Discover new councils
+    # 2) Discovery from data.gov.uk (no cache)
+    if progress:
+        progress.progress(42, text="Discovering councils and CSVs from data.gov.uk …")
     try:
         discovered = discover_new_councils()
     except Exception as e:
         discovered = []
-        st.info(f"Discovery skipped: {e}")
-
-    for j, (name, url) in enumerate(discovered, start=1):
-        pct = int(50 + (j / max(1, len(discovered))) * 35)
         if progress:
-            progress.progress(pct, text=f"Importing discovered: {name}")
+            progress.progress(45, text=f"Discovery error: {e}")
+
+    m = len(discovered)
+    for j, (name, url) in enumerate(discovered, start=1):
+        pct = int(45 + (j / max(1, m)) * 45)
+        if progress and (j % 10 == 0 or j == m):
+            progress.progress(pct, text=f"[{j}/{m}] Importing: {name}")
         try:
-            start = time.time()
-            records = fetch_new_council_csv(url, name)
-            elapsed = time.time() - start
-            if elapsed > 3.0:
+            records, timed_out, elapsed = _call_with_timeout(lambda: fetch_new_council_csv(url, name, timeout=3), timeout_s=3.0)
+            if records is None or timed_out:
                 failed.append((name, url, None))
                 continue
-            ins, skip = insert_records(records, do_geocode=False)  # discovery: no geocode
+            ins, skip = insert_records(records, do_geocode=False)  # no geocode for speed
             inserted_total += ins
             skipped_total += skip
         except Exception:
             failed.append((name, url, None))
 
-    # Retry failed councils once
-    for (name, url, fetch_fn) in failed:
+    # 3) Retry once
+    for k, (name, url, fetch_fn) in enumerate(failed, start=1):
         if progress:
-            progress.progress(90, text=f"Retrying {name}…")
+            progress.progress(95, text=f"Retrying ({k}/{len(failed)}): {name}")
         try:
             if callable(fetch_fn):
                 records = fetch_fn()
             elif url:
-                records = fetch_new_council_csv(url, name)
+                records = fetch_new_council_csv(url, name, timeout=6)  # slightly longer
             else:
-                records = []
+                continue
             ins, skip = insert_records(records, do_geocode=do_geocode)
             inserted_total += ins
             skipped_total += skip
         except Exception:
-            st.warning(f"Giving up on {name} after retry.")
+            pass
 
     if progress:
         progress.progress(100, text="All done!")
@@ -131,19 +148,17 @@ with st.spinner("Setting up database…"):
     create_tables()
 
 st.sidebar.header("Data controls")
-st.sidebar.info("Data refresh runs automatically on start.\n\nYou can also force an update with geocoding (slower).")
+st.sidebar.info("Automatic refresh runs on startup.\n\nUse the button to refresh with geocoding (slower).")
 
 geocode_refresh = st.sidebar.button("Refresh with geocoding (slow)")
 
 if "data_loaded" not in st.session_state:
-    # First run: auto refresh (no geocode)
     progress = st.sidebar.progress(0, text="Loading councils…")
     ins, skip = refresh_all_data(do_geocode=False, progress=progress)
     st.success(f"Startup load complete. Inserted {ins:,} new rows; skipped {skip:,}.")
     st.session_state.data_loaded = True
-
 elif geocode_refresh:
-    st.warning("Geocoding suppliers will be **slow** (free Nominatim). Please wait…")
+    st.warning("Geocoding suppliers will be **slow** (free Nominatim). Running now…")
     progress = st.sidebar.progress(0, text="Refreshing with geocoding…")
     ins, skip = refresh_all_data(do_geocode=True, progress=progress)
     st.success(f"Geocoded refresh complete. Inserted {ins:,} new rows; skipped {skip:,}.")
@@ -154,7 +169,7 @@ elif geocode_refresh:
 st.sidebar.subheader("Filters")
 councils = _get_councils()
 if not councils:
-    st.info("No data yet. Try refreshing again later.")
+    st.info("No data yet. Try refreshing again.")
     st.stop()
 
 sel_council = st.sidebar.selectbox("Council", councils, index=0)
@@ -166,7 +181,7 @@ params = [sel_council, start_date.isoformat(), end_date.isoformat()]
 sql = """
 SELECT * FROM payments
 WHERE council = ?
-  AND payment_date BETWEEN ? AND ?
+  AND (payment_date IS NULL OR payment_date BETWEEN ? AND ?)
 """
 if supplier_query.strip():
     sql += " AND lower(supplier) LIKE ?"
@@ -214,81 +229,35 @@ else:
         )
         st.plotly_chart(px.line(df_time, x="payment_month", y="amount_gbp", title="Payments over time"), use_container_width=True)
 
-    # Map if lat/lon available
-    if {"lat", "lon"}.issubset(df.columns) and df[["lat", "lon"]].notna().any().any():
-        figm = px.scatter_mapbox(
-            df.dropna(subset=["lat", "lon"]),
-            lat="lat",
-            lon="lon",
-            hover_name="supplier",
-            hover_data={"amount_gbp": ":.2f", "description": True, "lat": False, "lon": False},
-            size="amount_gbp",
-            zoom=5,
-            height=450,
-        )
-        figm.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=40, b=0), title="Geocoded payments")
-        st.plotly_chart(figm, use_container_width=True)
-
 # -------------------
 # Anomalies / Alerts
 # -------------------
 with st.expander("Anomalies / Alerts", expanded=False):
-    a1 = _query_df("""
-        SELECT id, council, supplier, amount_gbp, payment_date
-        FROM payments
-        WHERE council = ? AND amount_gbp > 100000
-        ORDER BY amount_gbp DESC
-    """, (sel_council,))
+    large, frequent, dup_inv, no_inv = detect_anomalies(sel_council)
+
     st.subheader("Large payments (> £100k)")
-    st.dataframe(a1, use_container_width=True)
+    if large:
+        st.dataframe(pd.DataFrame(large, columns=["id","council","supplier","amount_gbp","payment_date"]), use_container_width=True)
+    else:
+        st.caption("None found.")
 
-    a2 = _query_df("""
-        SELECT council, supplier, strftime('%Y-%m', payment_date) AS ym, COUNT(*) AS cnt, SUM(amount_gbp) AS total
-        FROM payments
-        WHERE council = ?
-        GROUP BY council, supplier, ym
-        HAVING cnt > 5
-        ORDER BY cnt DESC
-    """, (sel_council,))
     st.subheader("Frequent monthly payments (>5)")
-    st.dataframe(a2, use_container_width=True)
+    if frequent:
+        st.dataframe(pd.DataFrame(frequent, columns=["council","supplier","ym","cnt","total"]), use_container_width=True)
+    else:
+        st.caption("None found.")
 
-    a3 = _query_df("""
-        SELECT invoice_ref, COUNT(*) AS cnt, SUM(amount_gbp) AS total
-        FROM payments
-        WHERE council = ? AND invoice_ref IS NOT NULL AND TRIM(invoice_ref) <> ''
-        GROUP BY invoice_ref
-        HAVING cnt > 1
-        ORDER BY cnt DESC
-    """, (sel_council,))
     st.subheader("Duplicate invoice references")
-    st.dataframe(a3, use_container_width=True)
+    if dup_inv:
+        st.dataframe(pd.DataFrame(dup_inv, columns=["invoice_ref","cnt","total"]), use_container_width=True)
+    else:
+        st.caption("None found.")
 
-    a4 = _query_df("""
-        SELECT id, supplier, amount_gbp, payment_date, description
-        FROM payments
-        WHERE council = ? AND (invoice_ref IS NULL OR TRIM(invoice_ref) = '')
-        ORDER BY payment_date DESC
-    """, (sel_council,))
     st.subheader("Payments without invoice reference")
-    st.dataframe(a4, use_container_width=True)
-
-    dom = _query_df("""
-        WITH sums AS (
-            SELECT supplier, SUM(amount_gbp) AS total
-            FROM payments
-            WHERE council = ?
-            GROUP BY supplier
-        ), grand AS (
-            SELECT SUM(amount_gbp) AS gt FROM payments WHERE council = ?
-        )
-        SELECT s.supplier, s.total, g.gt, 100.0 * s.total / g.gt AS pct
-        FROM sums s, grand g
-        ORDER BY s.total DESC
-        LIMIT 1
-    """, (sel_council, sel_council))
-    if not dom.empty and float(dom["pct"].iloc[0]) > 50.0:
-        st.error(f"Supplier dominance: {dom['supplier'].iloc[0]} accounts for {dom['pct'].iloc[0]:.1f}% of spend (£{dom['total'].iloc[0]:,.0f}).")
+    if no_inv:
+        st.dataframe(pd.DataFrame(no_inv, columns=["id","supplier","amount_gbp","payment_date","description"]), use_container_width=True)
+    else:
+        st.caption("None found.")
 
 # -------------------
 # Feedback form
