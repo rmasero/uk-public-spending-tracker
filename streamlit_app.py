@@ -1,98 +1,287 @@
 # streamlit_app.py
 
-import streamlit as st
+import io
+import os
+import time
+import sqlite3
+import traceback
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
 import pandas as pd
-import requests
+import streamlit as st
 
-from council_auto_discovery import fetch_new_council_csv
-from db import insert_records, get_all_data
+# --- Use ONLY modules that actually exist in this repo ---
+import fetch_and_ingest as ingest  # insert_records + geocode hook lives here
+from fetch_and_ingest import insert_records
+from db_schema import create_tables
+from pattern_detection import detect_anomalies
+from council_auto_discovery import discover_new_councils, fetch_new_council_csv
 
-
-# --- Column mappings (normalise council CSVs into our DB schema) ---
-COLUMN_MAPPINGS = {
-    "supplier name": "supplier",
-    "supplier": "supplier",
-    "amount": "amount_gbp",
-    "net amount": "amount_gbp",
-    "value": "amount_gbp",
-    "payment date": "payment_date",
-    "date": "payment_date",
-    "invoice number": "invoice_ref",
-    "invoice no": "invoice_ref",
-    "description": "description",
-    "details": "description",
-}
+DB_NAME = "spend.db"
 
 
-def normalise_dataframe(df, council_name):
-    """Map council CSV columns into our standard schema."""
-    df.columns = [c.lower().strip() for c in df.columns]
+# --------------------------
+# Helpers
+# --------------------------
+def run_once_per_session(key: str) -> bool:
+    """Return True the first time per session for a given key."""
+    if key not in st.session_state:
+        st.session_state[key] = True
+        return True
+    return False
 
-    # Rename where possible
-    df = df.rename(columns={k: v for k, v in COLUMN_MAPPINGS.items() if k in df.columns})
 
-    # Ensure all required columns exist
-    keep_cols = ["supplier", "amount_gbp", "payment_date", "invoice_ref", "description"]
-    for col in keep_cols:
-        if col not in df.columns:
-            df[col] = None
+def fetch_records_with_timeout(url: str, council_name: str, timeout_secs: float = 3.0):
+    """
+    Call council_auto_discovery.fetch_new_council_csv(url, council_name)
+    but enforce a wall-clock timeout so we can skip slow councils.
+    """
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(fetch_new_council_csv, url, council_name)
+        return fut.result(timeout=timeout_secs)
 
-    df = df[keep_cols]
-    df["council"] = council_name
+
+def safe_insert(records, geocode_enabled: bool):
+    """
+    Insert records using fetch_and_ingest.insert_records.
+    If geocoding is disabled, monkey-patch ingest.geocode_address to a no-op.
+    """
+    original_geocoder = getattr(ingest, "geocode_address", None)
+
+    try:
+        if not geocode_enabled and original_geocoder is not None:
+            # Disable geocoding for speed on the initial auto run
+            ingest.geocode_address = lambda supplier: (None, None)
+
+        insert_records(records)
+
+    finally:
+        # Restore original geocoder
+        if original_geocoder is not None:
+            ingest.geocode_address = original_geocoder
+
+
+def ensure_db():
+    # Create tables if needed
+    create_tables()
+    # Ensure DB file exists
+    if not os.path.exists(DB_NAME):
+        open(DB_NAME, "a").close()
+
+
+def load_existing_dataframe(selected_council=None, date_from=None, date_to=None) -> pd.DataFrame:
+    query = "SELECT council, payment_date, supplier, description, category, amount_gbp, invoice_ref, lat, lon FROM payments"
+    clauses = []
+    params = []
+
+    if selected_council and selected_council != "All":
+        clauses.append("council = ?")
+        params.append(selected_council)
+
+    if date_from:
+        clauses.append("DATE(payment_date) >= DATE(?)")
+        params.append(date_from)
+
+    if date_to:
+        clauses.append("DATE(payment_date) <= DATE(?)")
+        params.append(date_to)
+
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+
+    query += " ORDER BY DATE(payment_date) DESC"
+
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        df = pd.read_sql_query(query, conn, params=params)
+    finally:
+        conn.close()
     return df
 
 
-def load_and_insert_new_councils():
-    """Discover new council CSVs, fetch them, normalise, insert into DB."""
-    st.info("🔍 Discovering councils and fetching CSVs…")
-    council_csvs = fetch_new_council_csv()
+def list_councils_in_db() -> list:
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT council FROM payments ORDER BY council ASC")
+        rows = [r[0] for r in c.fetchall()]
+    finally:
+        conn.close()
+    return rows
 
-    inserted_total = 0
 
-    for i, (council, url) in enumerate(council_csvs, start=1):
-        st.write(f"[{i}/{len(council_csvs)}] Processing {council} → {url}")
+def discover_and_ingest(geocode_enabled: bool, max_pages_info: str = ""):
+    """
+    1) Discover councils + CSV URLs
+    2) Fetch each council's records with a 3-second timeout
+    3) Skip slow ones and retry once after the first pass
+    4) Insert into DB (geocoding optional)
+    """
+    with st.status("Starting discovery…", state="running") as status:
+        status.update(label="Discovering councils on data.gov.uk…")
 
+        # Discover (uses your council_auto_discovery module)
         try:
-            # Timeout after 3 seconds per council fetch
-            resp = requests.get(url, timeout=3)
-            resp.raise_for_status()
-
-            df = pd.read_csv(pd.compat.StringIO(resp.text))
-            df = normalise_dataframe(df, council)
-
-            records = df.to_dict(orient="records")
-            insert_records(records)
-            inserted_total += len(records)
-
-            st.success(f"Inserted {len(records)} rows for {council}")
-
+            discovered = discover_new_councils()
         except Exception as e:
-            st.warning(f"⚠️ Skipping {council} due to error: {e}")
+            st.error(f"Discovery failed: {e}")
+            st.text(traceback.format_exc())
+            return 0, 0, 0
 
-    st.success(f"🎉 Finished: {inserted_total} rows inserted into database.")
+        total = len(discovered)
+        status.update(label=f"Discovery complete: {total} council CSVs found. Preparing to fetch…")
+
+        progress = st.progress(0, text="Fetching & inserting data…")
+        successes, failures, timeouts = 0, 0, 0
+        retry_queue = []
+
+        # First pass (skip anything that takes >3s)
+        for idx, (council_name, url) in enumerate(discovered, start=1):
+            progress.progress(min(idx / max(total, 1), 1.0),
+                              text=f"[{idx}/{total}] {council_name} — fetching (3s timeout)…")
+
+            start = time.time()
+            try:
+                records = fetch_records_with_timeout(url, council_name, timeout_secs=3.0)
+                # insert
+                safe_insert(records, geocode_enabled=geocode_enabled)
+                successes += 1
+            except FuturesTimeout:
+                timeouts += 1
+                retry_queue.append((council_name, url))
+            except Exception as e:
+                failures += 1
+                st.write(f"Skipping {council_name} due to error: {e}")
+
+            elapsed = time.time() - start
+            # Small sleep to keep UI responsive
+            if elapsed < 0.05:
+                time.sleep(0.02)
+
+        # Retry pass (once) for timeouts
+        if retry_queue:
+            status.update(label=f"Retrying {len(retry_queue)} timed-out councils (once)…")
+            for idx, (council_name, url) in enumerate(retry_queue, start=1):
+                progress.progress(min(idx / max(len(retry_queue), 1), 1.0),
+                                  text=f"[retry {idx}/{len(retry_queue)}] {council_name} — fetching (3s timeout)…")
+                try:
+                    records = fetch_records_with_timeout(url, council_name, timeout_secs=3.0)
+                    safe_insert(records, geocode_enabled=geocode_enabled)
+                    successes += 1
+                except Exception:
+                    failures += 1  # if it times out again or errors, count as failure
+
+        status.update(
+            label=f"Done. Success: {successes}, Failed: {failures}, Timed out (not inserted): {timeouts}.",
+            state="complete"
+        )
+
+    return successes, failures, timeouts
 
 
-def main():
-    st.title("UK Public Spending Tracker")
+# --------------------------
+# UI
+# --------------------------
+st.set_page_config(page_title="UK Public Spending Tracker", layout="wide")
+st.title("UK Public Spending Tracker")
 
-    st.info("Loading data automatically. This may take a few minutes…")
+with st.sidebar:
+    st.header("Controls")
+    st.caption("Initial load runs automatically without geocoding for speed. "
+               "Use the **Update & Geocode (slow)** button to enrich with coordinates.")
+    auto_limit = st.number_input("Preview rows per council (UI only)", 50, 2000, 200, step=50)
 
-    # Run discovery + load at startup
-    load_and_insert_new_councils()
+# Prepare the DB
+with st.spinner("Setting up database..."):
+    ensure_db()
 
-    # Button to refresh/update
-    if st.button("🔄 Update Data (may be slow)"):
-        load_and_insert_new_councils()
+# Auto-run on first load (no geocoding)
+if run_once_per_session("__bootstrapped__"):
+    st.info("Auto-loading councils & payments (geocoding OFF for speed)…")
+    succ, fail, tout = discover_and_ingest(geocode_enabled=False)
+    st.success(f"Initial load complete. Success: {succ}, Failures: {fail}, Timeouts: {tout}.")
+else:
+    st.caption("Session active. Use the update button to refresh.")
 
-    # Show data preview
-    all_data = get_all_data()
-    if all_data:
-        df = pd.DataFrame(all_data)
-        st.write("📊 Data preview:")
-        st.dataframe(df.head(50))
-    else:
-        st.warning("No data available in the database.")
+# Update button (WITH geocoding, slow)
+if st.button("🔄 Update & Geocode (slow)"):
+    st.warning("This may be **slow** due to geocoding. Please keep the tab open; progress will be shown below.")
+    succ, fail, tout = discover_and_ingest(geocode_enabled=True)
+    st.success(f"Update complete. Success: {succ}, Failures: {fail}, Timeouts: {tout}.")
 
+st.divider()
 
-if __name__ == "__main__":
-    main()
+# --------------------------
+# Data explorer
+# --------------------------
+st.subheader("Explore data")
+
+# Filters
+councils = ["All"] + list_councils_in_db()
+left, right = st.columns(2)
+with left:
+    selected_council = st.selectbox("Council", councils, index=0)
+with right:
+    col1, col2 = st.columns(2)
+    with col1:
+        date_from = st.date_input("From", value=None)
+    with col2:
+        date_to = st.date_input("To", value=None)
+
+# Load filtered data
+df = load_existing_dataframe(
+    selected_council=None if selected_council == "All" else selected_council,
+    date_from=str(date_from) if date_from else None,
+    date_to=str(date_to) if date_to else None,
+)
+
+# Show preview
+if df.empty:
+    st.warning("No data available yet for the selected filters.")
+else:
+    st.write(f"Showing {min(len(df), auto_limit)} of {len(df)} rows")
+    st.dataframe(df.head(auto_limit), use_container_width=True)
+
+    # Simple summaries
+    with st.expander("Summary"):
+        total_amount = df["amount_gbp"].fillna(0).sum() if "amount_gbp" in df.columns else 0
+        st.write(f"**Payments:** {len(df):,} | **Total amount (shown rows)**: £{total_amount:,.2f}")
+
+# --------------------------
+# Anomaly detection (uses your pattern_detection.py)
+# --------------------------
+st.subheader("Pattern detection")
+try:
+    large, frequent = detect_anomalies()
+    colA, colB = st.columns(2)
+    with colA:
+        st.write("**Large payments**")
+        if large:
+            st.dataframe(pd.DataFrame(large, columns=["council", "supplier", "amount_gbp"]))
+        else:
+            st.caption("No large payments flagged.")
+    with colB:
+        st.write("**Frequent payments**")
+        if frequent:
+            st.dataframe(pd.DataFrame(frequent, columns=["council", "supplier", "cnt"]))
+        else:
+            st.caption("No frequent payments flagged.")
+except Exception as e:
+    st.warning(f"Pattern detection unavailable: {e}")
+
+# --------------------------
+# CSV download for current filter
+# --------------------------
+st.subheader("Export")
+if not df.empty:
+    csv_data = df.to_csv(index=False).encode("utf-8")
+    fname_council = (selected_council or "All").replace(" ", "_")
+    st.download_button(
+        label="Download current view as CSV",
+        data=csv_data,
+        file_name=f"{fname_council}_payments.csv",
+        mime="text/csv"
+    )
+
+st.caption("Tip: Use the update button to refresh data and add geocodes (slow).")
