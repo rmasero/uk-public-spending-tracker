@@ -1,52 +1,94 @@
-# council_auto_discovery.py (updated)
+# council_auto_discovery.py
 
 import requests
-import pandas as pd
-from io import BytesIO
+import streamlit as st
 
-# Optional: place for special council fetchers if needed
-FETCHERS = {}
+# Broader search query terms to capture all spending datasets
+QUERY_TERMS = [
+    "\"Council Spending\"",
+    "\"Local Authority Spend\"",
+    "\"Payments to suppliers\"",
+    "\"Spend over\"",
+    "\"Spend over £500\"",
+]
+
+Q = " OR ".join(QUERY_TERMS)
+
+API_BASE = "https://data.gov.uk/api/3/action/package_search"
 
 
-def discover_new_councils():
+def _extract_url(res):
+    """Return the best URL for a resource (prefer download_url)."""
+    return res.get("download_url") or res.get("url")
+
+
+def discover_new_councils(rows_per_page=1000, max_pages=10):
     """
-    Placeholder: should return a list of (council_name, url) pairs.
-    In practice this might scrape a registry or load from a config.
+    Discover new councils and their spending CSVs from data.gov.uk.
+    Returns a list of (council_name, csv_url).
     """
-    # Example placeholder — in real app this is already filled dynamically
-    return []
+    discovered = []
+    seen_urls = set()
+
+    st.info("Starting council discovery from data.gov.uk…")
+
+    for page in range(max_pages):
+        start = page * rows_per_page
+        params = {
+            "q": Q,
+            "start": start,
+            "rows": rows_per_page,
+        }
+
+        try:
+            resp = requests.get(API_BASE, params=params, timeout=15)
+            resp.raise_for_status()
+        except Exception as e:
+            st.warning(f"Failed to fetch page {page+1}: {e}")
+            continue
+
+        data = resp.json()
+        results = data.get("result", {}).get("results", [])
+        if not results:
+            st.write(f"No more datasets found after {page} pages.")
+            break
+
+        st.write(f"Page {page+1}: {len(results)} datasets fetched")
+
+        for pkg in results:
+            org = pkg.get("organization", {})
+            council_name = org.get("title") or org.get("name")
+            if not council_name:
+                continue
+
+            for res in pkg.get("resources", []):
+                fmt = str(res.get("format", "")).lower()
+                url = _extract_url(res)
+                if fmt == "csv" and url and url not in seen_urls:
+                    discovered.append((council_name, url))
+                    seen_urls.add(url)
+
+        # Stop if we’ve exhausted total results
+        total = data.get("result", {}).get("count", 0)
+        if start + rows_per_page >= total:
+            st.write("All available datasets scanned.")
+            break
+
+    st.success(f"Discovery complete: {len(discovered)} council CSVs found")
+    return discovered
 
 
-def fetch_new_council_csv(url, council_name):
+# --- Backwards compatibility for the rest of the app ---
+def fetch_new_council_csv(rows_per_page=1000, max_pages=10):
     """
-    Fetch a council's spending CSV.
-    - Ensures valid HTTP response.
-    - Skips HTML/invalid responses gracefully.
-    - Returns a list of dicts for DB insertion.
+    Legacy alias for discover_new_councils so existing code keeps working.
     """
+    return discover_new_councils(rows_per_page=rows_per_page, max_pages=max_pages)
 
-    if council_name in FETCHERS:
-        return FETCHERS[council_name]()
 
-    try:
-        r = requests.get(url, timeout=10)
-
-        # HTTP check
-        if r.status_code != 200:
-            raise ValueError(f"HTTP {r.status_code} when fetching {url}")
-
-        # Content type check
-        content_type = r.headers.get("Content-Type", "").lower()
-        if "csv" not in content_type and "excel" not in content_type:
-            # Not a CSV — likely HTML or error page
-            snippet = r.text[:500]
-            raise ValueError(
-                f"Unexpected content type ({content_type}). "
-                f"First 500 chars:\n{snippet}"
-            )
-
-        # Parse as CSV
-        df = pd.read_csv(BytesIO(r.content))
-
-    except Exception as e:
-        # Raise with council name for
+if __name__ == "__main__":
+    # For debugging outside Streamlit
+    councils = discover_new_councils()
+    print(f"Discovered {len(councils)} councils")
+    for c, u in councils[:10]:
+        print(c, "->", u)
