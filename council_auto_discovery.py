@@ -78,6 +78,14 @@ def discover_new_councils(rows_per_page=1000, max_pages=10):
     return discovered
 
 
+# --- Backwards compatibility for the rest of the app ---
+def fetch_new_council_csv(rows_per_page=1000, max_pages=10):
+    """
+    Legacy alias for discover_new_councils so existing code keeps working.
+    """
+    return discover_new_councils(rows_per_page=rows_per_page, max_pages=max_pages)
+
+
 if __name__ == "__main__":
     # For debugging outside Streamlit
     councils = discover_new_councils()
