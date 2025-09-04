@@ -13,6 +13,7 @@ import streamlit as st
 from db_schema import create_tables, DB_NAME
 from fetch_and_ingest import insert_records
 from council_auto_discovery import discover_new_councils, fetch_new_council_csv
+from councils_catalog import load_catalog, build_catalog
 
 st.set_page_config(page_title="UK Public Spending Tracker", layout="wide")
 st.title("UK Public Spending Tracker")
@@ -50,80 +51,112 @@ def _load_predefined_councils() -> List[Tuple[str, str, Callable]]:
     return items
 
 # -------------------
-# Refresh logic
+# Refresh logic with progress + timeouts
 # -------------------
+def _fetch_with_timeout(name: str, fetch_callable, timeout_s: float = 3.0):
+    """
+    Run fetch_callable() but stop if it takes longer than timeout_s.
+    Returns (records or None, timed_out: bool)
+    """
+    start = time.time()
+    try:
+        records = fetch_callable()
+        elapsed = time.time() - start
+        if elapsed > timeout_s:
+            return None, True
+        return records, False
+    except Exception:
+        return None, False
+
 def refresh_all_data(do_geocode: bool = False, progress=None):
     inserted_total = skipped_total = 0
     failed = []
 
-    # 1) Predefined councils
+    # 0) Make sure we have a catalog ready
+    if progress:
+        progress.progress(2, text="Loading council catalog…")
+    catalog = load_catalog()
+    if not catalog:
+        catalog = build_catalog()
+    if progress:
+        progress.progress(5, text=f"Catalog ready: {len(catalog)} councils found")
+
+    # 1) Predefined councils first (custom fetchers > URLs)
     items = _load_predefined_councils()
     for i, (name, csv_url, fetch_fn) in enumerate(items, start=1):
-        pct = int(5 + (i / max(1, len(items))) * 40)
+        pct = int(6 + (i / max(1, len(items))) * 34)
         if progress:
-            progress.progress(pct, text=f"Fetching: {name}")
+            progress.progress(pct, text=f"[{i}/{len(items)}] Fetching (custom): {name}")
         try:
-            start = time.time()
+            # Prefer custom fetcher
             if callable(fetch_fn):
-                records = fetch_fn()
+                records, timed_out = _fetch_with_timeout(name, fetch_fn, timeout_s=3.0)
+                if timed_out or records is None:
+                    failed.append((name, csv_url, fetch_fn))
+                    continue
+            # fallback to declared CSV if present
             elif csv_url:
-                records = fetch_new_council_csv(csv_url, name)
+                def call(): return fetch_new_council_csv(csv_url, name, timeout=3)
+                records, timed_out = _fetch_with_timeout(name, call, timeout_s=3.0)
+                if timed_out or records is None:
+                    failed.append((name, csv_url, None))
+                    continue
             else:
-                records = []
-            elapsed = time.time() - start
-            if elapsed > 3.0:
-                failed.append((name, csv_url, fetch_fn))
-                continue
+                # Use catalog urls
+                urls = (catalog.get(name, {}) or {}).get("csv_urls", [])
+                if not urls:
+                    continue
+                def call(): return fetch_new_council_csv(urls[0], name, timeout=3)
+                records, timed_out = _fetch_with_timeout(name, call, timeout_s=3.0)
+                if timed_out or records is None:
+                    failed.append((name, urls[0], None))
+                    continue
+
             ins, skip = insert_records(records, do_geocode=do_geocode)
             inserted_total += ins
             skipped_total += skip
         except Exception:
             failed.append((name, csv_url, fetch_fn))
 
-    # 2) Discover new councils
-    try:
-        discovered = discover_new_councils()
-    except Exception as e:
-        discovered = []
-        st.info(f"Discovery skipped: {e}")
-
+    # 2) All councils from catalog (that we didn't already try)
+    discovered = discover_new_councils()
     for j, (name, url) in enumerate(discovered, start=1):
-        pct = int(50 + (j / max(1, len(discovered))) * 35)
-        if progress:
-            progress.progress(pct, text=f"Importing discovered: {name}")
+        pct = int(41 + (j / max(1, len(discovered))) * 49)
+        if progress and j % 5 == 0:
+            progress.progress(pct, text=f"[{j}/{len(discovered)}] Importing: {name}")
         try:
-            start = time.time()
-            records = fetch_new_council_csv(url, name)
-            elapsed = time.time() - start
-            if elapsed > 3.0:
+            def call(): return fetch_new_council_csv(url, name, timeout=3)
+            records, timed_out = _fetch_with_timeout(name, call, timeout_s=3.0)
+            if timed_out or records is None:
                 failed.append((name, url, None))
                 continue
-            ins, skip = insert_records(records, do_geocode=False)  # discovery: no geocode
+            ins, skip = insert_records(records, do_geocode=False)  # catalog import: no geocode for speed
             inserted_total += ins
             skipped_total += skip
         except Exception:
             failed.append((name, url, None))
 
-    # Retry failed councils once
-    for (name, url, fetch_fn) in failed:
+    # 3) Retry once after everything
+    for k, (name, url, fetch_fn) in enumerate(failed, start=1):
         if progress:
-            progress.progress(90, text=f"Retrying {name}…")
+            progress.progress(92, text=f"Retrying ({k}/{len(failed)}): {name}")
         try:
             if callable(fetch_fn):
                 records = fetch_fn()
             elif url:
-                records = fetch_new_council_csv(url, name)
+                records = fetch_new_council_csv(url, name, timeout=6)  # allow slightly longer on retry
             else:
-                records = []
+                continue
             ins, skip = insert_records(records, do_geocode=do_geocode)
             inserted_total += ins
             skipped_total += skip
         except Exception:
-            st.warning(f"Giving up on {name} after retry.")
+            # Give up quietly after retry
+            pass
 
     if progress:
         progress.progress(100, text="All done!")
-    return inserted_total, skipped_total
+    return inserted_total, skipped_total, catalog
 
 # -------------------
 # App start
@@ -139,15 +172,28 @@ geocode_refresh = st.sidebar.button("Refresh with geocoding (slow)")
 if "data_loaded" not in st.session_state:
     # First run: auto refresh (no geocode)
     progress = st.sidebar.progress(0, text="Loading councils…")
-    ins, skip = refresh_all_data(do_geocode=False, progress=progress)
+    ins, skip, catalog = refresh_all_data(do_geocode=False, progress=progress)
     st.success(f"Startup load complete. Inserted {ins:,} new rows; skipped {skip:,}.")
     st.session_state.data_loaded = True
-
+    st.session_state.catalog = catalog
 elif geocode_refresh:
     st.warning("Geocoding suppliers will be **slow** (free Nominatim). Please wait…")
     progress = st.sidebar.progress(0, text="Refreshing with geocoding…")
-    ins, skip = refresh_all_data(do_geocode=True, progress=progress)
+    ins, skip, catalog = refresh_all_data(do_geocode=True, progress=progress)
     st.success(f"Geocoded refresh complete. Inserted {ins:,} new rows; skipped {skip:,}.")
+    st.session_state.catalog = catalog
+
+# Catalog download
+cat = st.session_state.get("catalog") or load_catalog()
+if cat:
+    import json
+    st.download_button(
+        "Download council catalog (JSON)",
+        json.dumps(cat, ensure_ascii=False, indent=2).encode("utf-8"),
+        file_name="councils_catalog.json",
+        mime="application/json",
+        help="Full list of councils and CSV resource links discovered from data.gov.uk",
+    )
 
 # -------------------
 # Filters
